@@ -1408,7 +1408,7 @@ fn read_manifest(
             || error_text.contains("missing field `primary_provider_id`")
         {
             format!(
-                "Gateway proxy manifest {} was created by an older AI Toolbox version. Click Gateway proxy on the applied provider again to re-engage this CLI.",
+                "Gateway proxy manifest {} was created by an older AI Toolbox Gateway Router version. Click Gateway proxy on the applied provider again to re-engage this CLI.",
                 manifest_path.display()
             )
         } else {

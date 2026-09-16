@@ -22,7 +22,8 @@ pub enum AutoLaunchError {
 }
 
 /// macOS: Get .app bundle path from executable path
-/// Converts `/path/to/AI Toolbox.app/Contents/MacOS/AI Toolbox` to `/path/to/AI Toolbox.app`
+/// Converts `/path/to/AI Toolbox Gateway Router.app/Contents/MacOS/AI Toolbox Gateway Router`
+/// to `/path/to/AI Toolbox Gateway Router.app`
 #[cfg(target_os = "macos")]
 fn get_macos_app_bundle_path(exe_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let path_str = exe_path.to_string_lossy();
@@ -39,7 +40,7 @@ fn get_macos_app_bundle_path(exe_path: &std::path::Path) -> Option<std::path::Pa
 fn get_auto_launch() -> Result<auto_launch::AutoLaunch, AutoLaunchError> {
     use auto_launch::AutoLaunchBuilder;
 
-    let app_name = "AI Toolbox";
+    let app_name = "AI Toolbox Gateway Router";
     let exe_path = std::env::current_exe().map_err(|e| AutoLaunchError::ExePath(e.to_string()))?;
 
     // macOS needs .app bundle path, otherwise AppleScript login item will open terminal

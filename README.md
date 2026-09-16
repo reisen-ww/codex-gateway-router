@@ -1,7 +1,9 @@
-# AI Toolbox
+# AI Toolbox Gateway Router
+
+这是基于 [AI Toolbox](https://github.com/coulsontl/ai-toolbox) 的 MIT fork，增加了 Codex 多站点聚合路由：把多个 API 站点的模型合并进 Codex 模型列表，并按站点前缀自动路由。
 
 <p align="center">
-  <img src="tauri/icons/128x128@2x.png" alt="AI Toolbox Logo" width="128" height="128">
+  <img src="tauri/icons/128x128@2x.png" alt="AI Toolbox Gateway Router Logo" width="128" height="128">
 </p>
 
 <p align="center">
@@ -24,7 +26,7 @@
 
 ## 简介
 
-AI Toolbox 是一个跨平台桌面应用，旨在帮助开发者高效管理各类 AI 编程助手的配置。支持 **Windows**、**macOS** 和 **Linux**。
+AI Toolbox Gateway Router 基于上游 AI Toolbox，是一个跨平台桌面应用，旨在帮助开发者高效管理各类 AI 编程助手的配置。支持 **Windows**、**macOS** 和 **Linux**。
 
 ### 主要功能
 

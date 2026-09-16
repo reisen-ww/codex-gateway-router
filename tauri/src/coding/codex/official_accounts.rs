@@ -305,7 +305,7 @@ fn wait_for_oauth_callback_with_timeout(
     let response_body = if let Some(error) = query_params.get("error") {
         format!("OAuth login failed: {error}")
     } else {
-        "OAuth login completed. You can return to AI Toolbox.".to_string()
+        "OAuth login completed. You can return to AI Toolbox Gateway Router.".to_string()
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

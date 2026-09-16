@@ -52,7 +52,7 @@ pub(crate) fn build_main_window<R: tauri::Runtime>(
         .unwrap_or((1200.0, 800.0));
 
     let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-        .title("AI Toolbox")
+        .title("AI Toolbox Gateway Router")
         .inner_size(width, height)
         .min_inner_size(800.0, 600.0)
         .visible(false)
@@ -894,7 +894,7 @@ pub fn run() {
     setup_panic_hook();
 
     info!("========================================");
-    info!("AI Toolbox 启动中...");
+    info!("AI Toolbox Gateway Router 启动中...");
     info!("版本: {}", env!("CARGO_PKG_VERSION"));
     info!("操作系统: {}", std::env::consts::OS);
     info!("架构: {}", std::env::consts::ARCH);
@@ -939,7 +939,7 @@ pub fn run() {
             }
             Err(e) => {
                 error!("单实例检测失败: {}", e);
-                eprintln!("AI Toolbox 已经在运行中。");
+                eprintln!("AI Toolbox Gateway Router 已经在运行中。");
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

@@ -182,7 +182,7 @@ const MainLayout: React.FC = () => {
         >
           <img
             src="/tray-icon.png"
-            alt="AI Toolbox"
+            alt="AI Toolbox Gateway Router"
             className={styles.dragBarIcon}
             data-tauri-drag-region
           />

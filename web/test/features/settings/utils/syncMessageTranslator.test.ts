@@ -41,6 +41,22 @@ test('skills foreign path warning is translated with skill, tool, and path', () 
   );
 });
 
+test('skills foreign path warning accepts the Gateway Router brand', () => {
+  assert.equal(
+    translateSyncMessage(
+      "技能 'git-commit-batcher' 在工具 'Qoder' 的路径 '~/.qoder/skills/git-commit-batcher' 不是 AI Toolbox Gateway Router 管理的链接，已保留原样",
+      'wsl',
+      stubT,
+    ),
+    'settings.syncMessages.skillsForeignPathKept?' +
+      JSON.stringify({
+        skill: 'git-commit-batcher',
+        tool: 'Qoder',
+        path: '~/.qoder/skills/git-commit-batcher',
+      }),
+  );
+});
+
 test('skills link maintenance failure warning keeps the raw detail', () => {
   assert.equal(
     translateSyncMessage(

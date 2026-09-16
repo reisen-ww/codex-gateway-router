@@ -277,7 +277,7 @@ pub fn build_local_tokio_command(program_path: &Path) -> TokioCommand {
 pub fn local_cli_missing_hint(command_name: &str) -> String {
     let manual_hint = manual_cli_override_hint(command_name);
     let mut message = format!(
-        "未找到 `{command_name}` CLI。AI Toolbox 已检查当前 PATH、常见安装路径，以及 nvm、volta、fnm、nvm-windows、bun、mise、asdf 管理的全局 bin；macOS 从 Dock/Finder/Spotlight 启动时不会继承终端 shell PATH。请确认 CLI 已安装。"
+        "未找到 `{command_name}` CLI。AI Toolbox Gateway Router 已检查当前 PATH、常见安装路径，以及 nvm、volta、fnm、nvm-windows、bun、mise、asdf 管理的全局 bin；macOS 从 Dock/Finder/Spotlight 启动时不会继承终端 shell PATH。请确认 CLI 已安装。"
     );
     if !manual_hint.is_empty() {
         message.push(' ');

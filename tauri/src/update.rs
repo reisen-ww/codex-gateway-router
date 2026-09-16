@@ -47,7 +47,7 @@ pub struct UpdateCheckResult {
 /// honors `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` environment variables.
 #[tauri::command]
 pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
-    const GITHUB_REPO: &str = "coulsontl/ai-toolbox";
+    const GITHUB_REPO: &str = "reisen-ww/codex-gateway-router";
     let latest_json_url = format!(
         "https://github.com/{}/releases/latest/download/latest.json",
         GITHUB_REPO

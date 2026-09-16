@@ -72,7 +72,7 @@ fn warn_foreign_path_kept(
         warnings,
         app,
         format!(
-            "技能 '{}' 在工具 '{}' 的路径 '{}' 不是 AI Toolbox 管理的同步目标，已保留原样",
+            "技能 '{}' 在工具 '{}' 的路径 '{}' 不是 AI Toolbox Gateway Router 管理的同步目标，已保留原样",
             skill,
             tool_display_name(tool_key),
             link_path

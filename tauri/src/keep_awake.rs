@@ -79,8 +79,8 @@ impl KeepAwakeWorker {
 fn create_keep_awake_guard() -> Result<KeepAwake, KeepAwakeError> {
     Builder::default()
         .idle(true)
-        .reason("AI Toolbox is running")
-        .app_name("AI Toolbox")
+        .reason("AI Toolbox Gateway Router is running")
+        .app_name("AI Toolbox Gateway Router")
         .create()
         .map_err(|error| KeepAwakeError::Create(error.to_string()))
 }

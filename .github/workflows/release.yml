@@ -62,11 +62,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: 'AI Toolbox ${{ env.RELEASE_TAG }}'
+          name: 'AI Toolbox Gateway Router ${{ env.RELEASE_TAG }}'
           body: |
             See the assets to download this version and install.
 
-            ⚠️ Mac安装提示：`"应用程序"已损坏` 解决方法：`xattr -cr /Applications/AI\ Toolbox.app`
+            ⚠️ Mac安装提示：`"应用程序"已损坏` 解决方法：`xattr -cr /Applications/AI\ Toolbox\ Gateway\ Router.app`
           draft: true
           # Manual beta builds should be Pre-release; formal tag pushes stay as normal releases.
           prerelease: ${{ github.event_name == 'workflow_dispatch' }}
@@ -339,11 +339,11 @@ jobs:
               url "https://github.com/{repo}/releases/download/v#{{version}}/{intel_dmg}"
             end
 
-            name "AI Toolbox"
+            name "AI Toolbox Gateway Router"
             desc "Desktop toolbox for managing AI coding assistant configurations"
             homepage "https://github.com/{repo}"
 
-            app "AI Toolbox.app"
+            app "AI Toolbox Gateway Router.app"
           end
           '''
 
@@ -453,7 +453,7 @@ jobs:
                       'if (Test-Path "$dir\\uninstall.exe") { Start-Process -Wait -FilePath "$dir\\uninstall.exe" -ArgumentList \'/S\' }'
                   ]
               },
-              "shortcuts": [["ai-toolbox.exe", "AI Toolbox"]],
+              "shortcuts": [["ai-toolbox.exe", "AI Toolbox Gateway Router"]],
           }
 
           Path("bucket/ai-toolbox.json").write_text(

@@ -93,13 +93,13 @@ pub fn is_future_schema_error(error: &str) -> bool {
 
 pub fn future_schema_user_message(error: &str) -> String {
     format!(
-        "当前数据已由更高版本的 AI Toolbox 打开或迁移，不能回退到旧版本继续启动。\n\n请升级到最新版本后再打开应用，或恢复使用旧版本创建的兼容备份。\n\n技术信息：{error}"
+        "当前数据已由更高版本的 AI Toolbox Gateway Router 打开或迁移，不能回退到旧版本继续启动。\n\n请升级到最新版本后再打开应用，或恢复使用旧版本创建的兼容备份。\n\n技术信息：{error}"
     )
 }
 
 pub fn future_backup_schema_user_message(error: &str) -> String {
     format!(
-        "这个备份由更高版本的 AI Toolbox 创建，当前版本无法恢复。\n\n请升级 AI Toolbox 后再恢复，或选择旧版本创建的兼容备份。\n\n技术信息：{error}"
+        "这个备份由更高版本的 AI Toolbox Gateway Router 创建，当前版本无法恢复。\n\n请升级 AI Toolbox Gateway Router 后再恢复，或选择旧版本创建的兼容备份。\n\n技术信息：{error}"
     )
 }
 

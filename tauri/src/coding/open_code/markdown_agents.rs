@@ -357,7 +357,8 @@ pub async fn save_opencode_markdown_agent<R: tauri::Runtime>(
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     if content_hash(&current_content) != request.expected_content_hash {
         return Err(
-            "OpenCode Agent file changed outside AI Toolbox. Reload before saving.".to_string(),
+            "OpenCode Agent file changed outside AI Toolbox Gateway Router. Reload before saving."
+                .to_string(),
         );
     }
 
@@ -382,7 +383,8 @@ pub async fn delete_opencode_markdown_agent<R: tauri::Runtime>(
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     if content_hash(&current_content) != request.expected_content_hash {
         return Err(
-            "OpenCode Agent file changed outside AI Toolbox. Reload before deleting.".to_string(),
+            "OpenCode Agent file changed outside AI Toolbox Gateway Router. Reload before deleting."
+                .to_string(),
         );
     }
     fs::remove_file(&path)
