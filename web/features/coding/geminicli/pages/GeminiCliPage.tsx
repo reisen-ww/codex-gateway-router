@@ -730,8 +730,8 @@ const GeminiCliPage: React.FC = () => {
         restoreDirect: () => restoreProxyGatewayCliDirect('gemini'),
         engageSingle: () => engageProxyGatewaySingle('gemini', editingProvider?.id || ''),
         engageFailover: () => engageProxyGatewayFailover('gemini'),
-        engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-          engageProxyGatewayAggregate('gemini', providerIds, separator, aliases, naming),
+        engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+          engageProxyGatewayAggregate('gemini', providerIds, separator, aliases, naming, groups),
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           if (isLocalTemp) {

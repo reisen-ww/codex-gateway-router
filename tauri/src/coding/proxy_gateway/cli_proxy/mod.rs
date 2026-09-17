@@ -1,6 +1,9 @@
 pub mod manifest;
 
-use self::manifest::{validate_backup_rel_path, CliProxyManifest, CliProxyManifestFile};
+use self::manifest::{
+    validate_aggregate_groups, validate_backup_rel_path, AggregateGroup, CliProxyManifest,
+    CliProxyManifestFile,
+};
 use super::paths::ProxyGatewayPaths;
 use super::runtime::{
     load_candidate_providers, load_candidate_providers_with_settings_and_selection,
@@ -21,6 +24,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut, Item};
 
@@ -104,6 +108,11 @@ const CLAUDE_LEGACY_REASONING_MODEL_POINTER: &str = "/env/ANTHROPIC_REASONING_MO
 const DEFAULT_CODEX_PROVIDER_ID: &str = "custom";
 
 const CODEX_AUTH_MANAGED_FIELDS: [&str; 2] = ["OPENAI_API_KEY", "auth_mode"];
+/// Aggregate mode also owns the top-level pointer to its generated catalog.
+/// It is deliberately distinct from the provider-table fields so normal
+/// single/failover takeover continues to leave an existing catalog pointer
+/// alone.
+const CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD: &str = "model_catalog_json";
 const GROK_CONFIG_MANAGED_FIELDS: [&str; 2] = ["models.default", "model.ai-toolbox-gateway"];
 
 /// Default Kimi provider table key (official managed provider). Custom applied
@@ -158,6 +167,36 @@ fn is_codex_gateway_managed_fields(managed_fields: &[String]) -> bool {
     })
 }
 
+fn mark_codex_aggregate_catalog_pointer_as_managed(targets: &mut CliProxyTargets) {
+    if let Some(target) = targets
+        .files
+        .iter_mut()
+        .find(|target| target.kind == CODEX_CONFIG_KIND)
+    {
+        if !target
+            .managed_fields
+            .iter()
+            .any(|field| field == CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+        {
+            target
+                .managed_fields
+                .push(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD.to_string());
+        }
+    }
+}
+
+fn codex_manifest_manages_aggregate_catalog_pointer(manifest: &CliProxyManifest) -> bool {
+    manifest
+        .files
+        .iter()
+        .find(|file| file.kind == CODEX_CONFIG_KIND)
+        .is_some_and(|file| {
+            file.managed_fields
+                .iter()
+                .any(|field| field == CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+        })
+}
+
 fn kimi_config_managed_fields_for_provider(provider_key: &str) -> Vec<String> {
     vec![
         format!("providers.{provider_key}.type"),
@@ -177,6 +216,12 @@ struct CliProxyTargets {
     runtime_root: PathBuf,
     is_wsl_direct: bool,
     files: Vec<CliProxyTarget>,
+}
+
+#[derive(Debug)]
+struct CodexModelCatalogPointerRollback {
+    path: PathBuf,
+    original: Option<Item>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +245,14 @@ impl GatewayStatusProxyDetails {
                     separator: aggregate.separator.clone(),
                     aliases: aggregate.aliases.clone(),
                     naming: aggregate.naming,
+                    groups: aggregate
+                        .groups
+                        .iter()
+                        .map(|group| super::types::GatewayAggregateGroup {
+                            id: group.id.clone(),
+                            provider_ids: group.provider_ids.clone(),
+                        })
+                        .collect(),
                 }),
             provider_priorities: Vec::new(),
         }
@@ -490,21 +543,58 @@ pub async fn engage_single_cli(
 
     let mut targets = resolve_targets(db, cli_key).await?;
     let settings = settings::load_settings_from_sqlite_state(db)?;
+    let mut catalog_pointer_rollback = restore_aggregate_catalog_pointer_before_single_takeover(
+        paths,
+        cli_key,
+        &targets,
+        &primary_provider_id,
+    )?;
     let effective_origin =
         resolve_effective_base_origin(base_origin, targets.is_wsl_direct, &settings.wsl_host);
-    let mut manifest = prepare_manifest(
+    let mut manifest = match prepare_manifest(
         paths,
         cli_key,
         &effective_origin,
         &targets,
         GatewayProxyMode::Single,
         &primary_provider_id,
-    )?;
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(rollback_single_catalog_pointer_transition(
+                catalog_pointer_rollback.take(),
+                error,
+            ));
+        }
+    };
+    let codex_auth_backup_content =
+        match codex_auth_backup_content_for_cli(paths, cli_key, &manifest) {
+            Ok(content) => content,
+            Err(error) => {
+                return Err(rollback_single_catalog_pointer_transition(
+                    catalog_pointer_rollback.take(),
+                    error,
+                ));
+            }
+        };
+    let preserve_codex_official_auth = match codex_auth_preservation_enabled_for_cli(db, cli_key) {
+        Ok(preserve) => preserve,
+        Err(error) => {
+            return Err(rollback_single_catalog_pointer_transition(
+                catalog_pointer_rollback.take(),
+                error,
+            ));
+        }
+    };
     // Persist enabled manifest + backup metadata before rewriting runtime files.
     // If apply_gateway_config fails mid-way, retry must still reuse the original .bak.
     sync_manifest_managed_fields(&mut manifest, &targets);
-    write_manifest(paths, cli_key, &manifest)?;
-    let codex_auth_backup_content = codex_auth_backup_content_for_cli(paths, cli_key, &manifest)?;
+    if let Err(error) = write_manifest(paths, cli_key, &manifest) {
+        return Err(rollback_single_catalog_pointer_transition(
+            catalog_pointer_rollback.take(),
+            error,
+        ));
+    }
     if let Err(error) = apply_gateway_config(
         db,
         cli_key,
@@ -514,7 +604,7 @@ pub async fn engage_single_cli(
         GatewayProxyMode::Single,
         None,
         codex_auth_backup_content.as_deref(),
-        codex_auth_preservation_enabled_for_cli(db, cli_key)?,
+        preserve_codex_official_auth,
     ) {
         // Early enabled manifest protects the original .bak, but a failed apply must not leave
         // the CLI looking "taken over" with a half-patched runtime config.
@@ -529,9 +619,9 @@ pub async fn engage_single_cli(
     Ok(cli_takeover_status(db, paths, cli_key, gateway_status).await)
 }
 
-/// Engage aggregate mode: the Codex model list is the union of the selected
-/// sites' models, each named `<site_id><sep><model>`, and the gateway routes
-/// each request to the site named by that prefix.
+/// Engage aggregate mode: legacy mode exposes the selected sites' models as
+/// `<site_id><sep><model>` entries; strict-group mode exposes the per-group
+/// union as `<group>.<model>` entries and routes each request to that group.
 ///
 /// Only Codex is supported today: aggregate mode needs a generated model
 /// catalog, which is a Codex-only concept in this app.
@@ -544,6 +634,7 @@ pub async fn engage_aggregate_cli(
     separator: String,
     aliases: BTreeMap<String, String>,
     naming: crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode,
+    groups: Vec<AggregateGroup>,
 ) -> Result<GatewayCliTakeoverStatus, String> {
     if cli_key != GatewayCliKey::Codex {
         return Err("Aggregate mode is currently supported for Codex only".to_string());
@@ -551,7 +642,17 @@ pub async fn engage_aggregate_cli(
     if !is_supported_cli(cli_key) {
         return Err("This CLI is not supported by the gateway MVP".to_string());
     }
-    crate::coding::proxy_gateway::cli_proxy::manifest::validate_aggregate_separator(&separator)?;
+    // Strict groups always use the canonical `<group>.<model>` namespace.
+    // Legacy separator validation is intentionally skipped there so stale
+    // legacy settings cannot block or alter a group-driven takeover.
+    let separator = if groups.is_empty() {
+        crate::coding::proxy_gateway::cli_proxy::manifest::validate_aggregate_separator(
+            &separator,
+        )?;
+        separator
+    } else {
+        crate::coding::proxy_gateway::cli_proxy::manifest::AGGREGATE_DEFAULT_SEPARATOR.to_string()
+    };
     let Some(base_origin) = gateway_status.base_url.as_deref() else {
         return Err("Start the proxy gateway before enabling Gateway proxy".to_string());
     };
@@ -564,54 +665,86 @@ pub async fn engage_aggregate_cli(
     let available = load_candidate_providers(db, cli_key).await?;
     let mut ordered_ids = Vec::with_capacity(provider_ids.len());
     let mut ordered_providers = Vec::with_capacity(provider_ids.len());
-    for id in &provider_ids {
-        if ordered_ids.iter().any(|existing| existing == id) {
-            return Err(format!("Aggregate site '{id}' is selected more than once"));
+    if groups.is_empty() {
+        for id in &provider_ids {
+            if ordered_ids.iter().any(|existing| existing == id) {
+                return Err(format!("Aggregate site '{id}' is selected more than once"));
+            }
+            let Some(provider) = available.iter().find(|provider| &provider.id == id) else {
+                return Err(format!(
+                    "Site '{id}' is not available for Gateway proxy. {NO_PROXYABLE_PROVIDER_MESSAGE}"
+                ));
+            };
+            ordered_ids.push(provider.id.clone());
+            ordered_providers.push(provider.clone());
         }
-        let Some(provider) = available.iter().find(|provider| &provider.id == id) else {
-            return Err(format!(
-                "Site '{id}' is not available for Gateway proxy. {NO_PROXYABLE_PROVIDER_MESSAGE}"
-            ));
-        };
-        ordered_ids.push(provider.id.clone());
-        ordered_providers.push(provider.clone());
+    }
+    let available_ids = available
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    validate_aggregate_groups(&groups, &available_ids)?;
+    if !groups.is_empty() {
+        // Strict groups are the authoritative provider selection.  Rebuild
+        // both the manifest's legacy provider_ids and the catalog input from
+        // their ordered union so a stale/hand-written top-level selection
+        // cannot diverge from runtime group routing.
+        let grouped_ids = aggregate_group_provider_union(&groups);
+        if grouped_ids.is_empty() {
+            return Err("Strict aggregate groups must contain at least one provider".to_string());
+        }
+        ordered_ids = grouped_ids;
+        ordered_providers = ordered_ids
+            .iter()
+            .filter_map(|provider_id| {
+                available
+                    .iter()
+                    .find(|provider| &provider.id == provider_id)
+                    .cloned()
+            })
+            .collect();
     }
     if ordered_ids.is_empty() {
         return Err("Select at least one site for aggregate mode".to_string());
     }
-    let aliases = aliases
-        .into_iter()
-        .map(|(provider_id, alias)| (provider_id, alias.trim().to_string()))
-        .filter(|(_, alias)| !alias.is_empty())
-        .collect::<BTreeMap<_, _>>();
-    if let Some(unknown_provider_id) = aliases
-        .keys()
-        .find(|provider_id| !ordered_ids.iter().any(|id| id == *provider_id))
-    {
-        return Err(format!(
-            "Aggregate alias references unselected site '{unknown_provider_id}'"
-        ));
-    }
-    crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_aliases(&aliases)?;
-    // Runtime aggregate routing also keeps every enabled, unselected provider
-    // addressable by its provider id as a fallback. Validate aliases against
-    // that complete addressable set, not only the selected sites, so an alias
-    // cannot shadow an unselected provider id.
-    let all_available_ids = available
-        .iter()
-        .map(|provider| provider.id.clone())
-        .collect::<Vec<_>>();
-    crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_site_prefixes(
-        &all_available_ids,
-        &aliases,
-    )?;
+    let aliases = if groups.is_empty() {
+        let aliases = aliases
+            .into_iter()
+            .map(|(provider_id, alias)| (provider_id, alias.trim().to_string()))
+            .filter(|(_, alias)| !alias.is_empty())
+            .collect::<BTreeMap<_, _>>();
+        if let Some(unknown_provider_id) = aliases
+            .keys()
+            .find(|provider_id| !ordered_ids.iter().any(|id| id == *provider_id))
+        {
+            return Err(format!(
+                "Aggregate alias references unselected site '{unknown_provider_id}'"
+            ));
+        }
+        crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_aliases(&aliases)?;
+        // Runtime aggregate routing also keeps every enabled, unselected provider
+        // addressable by its provider id as a fallback. Validate aliases against
+        // that complete addressable set, not only the selected sites, so an alias
+        // cannot shadow an unselected provider id.
+        crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_site_prefixes(
+            &available_ids,
+            &aliases,
+        )?;
+        aliases
+    } else {
+        // Group ids, not site aliases, are the strict model namespace. Ignore
+        // legacy aliases entirely instead of letting stale invalid entries
+        // block engagement or influence the generated catalog.
+        BTreeMap::new()
+    };
 
     // The primary provider keeps the legacy field populated so older code paths
     // and the session-history bucketing keep working unchanged.
     let primary_provider_id = ordered_ids[0].clone();
     let primary_provider = ordered_providers[0].clone();
 
-    let targets = resolve_targets(db, cli_key).await?;
+    let mut targets = resolve_targets(db, cli_key).await?;
+    mark_codex_aggregate_catalog_pointer_as_managed(&mut targets);
     let settings = settings::load_settings_from_sqlite_state(db)?;
     let effective_origin =
         resolve_effective_base_origin(base_origin, targets.is_wsl_direct, &settings.wsl_host);
@@ -623,17 +756,25 @@ pub async fn engage_aggregate_cli(
         GatewayProxyMode::Aggregate,
         &primary_provider_id,
     )?;
-    manifest = manifest.with_aggregate(
+    manifest = manifest.with_aggregate_groups(
         ordered_ids.clone(),
         separator.clone(),
         aliases.clone(),
         naming,
+        groups.clone(),
     );
     sync_manifest_managed_fields(&mut manifest, &targets);
+
+    // Resolve all fallible takeover inputs before persisting an enabled
+    // manifest. If the existing Codex auth backup is missing or unreadable,
+    // the live aggregate takeover must remain untouched rather than leaving a
+    // manifest that claims the gateway is enabled but was never applied.
+    let codex_auth_backup_content = codex_auth_backup_content_for_cli(paths, cli_key, &manifest)?;
+    let preserve_codex_official_auth = codex_auth_preservation_enabled_for_cli(db, cli_key)?;
+    let mut targets_for_apply = targets;
+
     write_manifest(paths, cli_key, &manifest)?;
 
-    let codex_auth_backup_content = codex_auth_backup_content_for_cli(paths, cli_key, &manifest)?;
-    let mut targets_for_apply = resolve_targets(db, cli_key).await?;
     if let Err(error) = apply_gateway_config(
         db,
         cli_key,
@@ -643,13 +784,15 @@ pub async fn engage_aggregate_cli(
         GatewayProxyMode::Aggregate,
         None,
         codex_auth_backup_content.as_deref(),
-        codex_auth_preservation_enabled_for_cli(db, cli_key)?,
+        preserve_codex_official_auth,
     ) {
-        let _ = restore_gateway_config(cli_key, paths, &targets_for_apply, &manifest);
-        manifest.enabled = false;
-        manifest.updated_at = chrono::Utc::now().to_rfc3339();
-        let _ = write_manifest(paths, cli_key, &manifest);
-        return Err(error);
+        return Err(rollback_aggregate_takeover(
+            cli_key,
+            paths,
+            &targets_for_apply,
+            &mut manifest,
+            error,
+        ));
     }
 
     // Generate the aggregated catalog so Codex's model picker lists every
@@ -657,26 +800,27 @@ pub async fn engage_aggregate_cli(
     // catalog that does not match the routing manifest, so surface the error.
     if let Err(error) = write_codex_aggregate_catalog_file(
         db,
+        required_target_path(&targets_for_apply, CODEX_CONFIG_KIND)?,
         &ordered_providers,
         &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig {
             separator,
             aliases,
             naming,
         },
+        &groups,
     )
     .await
     {
-        // A manifest/config pair without its aggregate catalog is not a usable
-        // takeover: Codex would have no model slugs that the router can
-        // resolve. Roll back the runtime files and leave a disabled, direct
-        // manifest instead of trapping the CLI in a half-engaged state.
-        let _ = restore_gateway_config(cli_key, paths, &targets_for_apply, &manifest);
-        manifest.enabled = false;
-        manifest.mode = GatewayProxyMode::Single;
-        manifest.aggregate = None;
-        manifest.updated_at = chrono::Utc::now().to_rfc3339();
-        let _ = write_manifest(paths, cli_key, &manifest);
-        return Err(error);
+        // A manifest/config pair without its aggregate catalog pointer is not
+        // a usable takeover: Codex would not expose the slugs that the router
+        // can resolve. This also covers an atomic-pointer write failure.
+        return Err(rollback_aggregate_takeover(
+            cli_key,
+            paths,
+            &targets_for_apply,
+            &mut manifest,
+            error,
+        ));
     }
 
     sync_manifest_managed_fields(&mut manifest, &targets_for_apply);
@@ -684,25 +828,47 @@ pub async fn engage_aggregate_cli(
     Ok(cli_takeover_status(db, paths, cli_key, gateway_status).await)
 }
 
+/// Flatten strict-group members in group/priority order, preserving the first
+/// occurrence when a provider intentionally participates in multiple groups.
+///
+/// Strict groups are the source of truth for the provider union.  The returned
+/// order is used for the manifest's compatibility `provider_ids`, the primary
+/// provider, and the catalog input.
+fn aggregate_group_provider_union(groups: &[AggregateGroup]) -> Vec<String> {
+    let mut provider_ids = Vec::new();
+    for group in groups {
+        for provider_id in &group.provider_ids {
+            if !provider_ids.iter().any(|existing| existing == provider_id) {
+                provider_ids.push(provider_id.clone());
+            }
+        }
+    }
+    provider_ids
+}
+
 /// Build and write the aggregate model catalog for the Codex runtime root.
 async fn write_codex_aggregate_catalog_file(
     db: &SqliteDbState,
+    config_path: &Path,
     providers: &[UpstreamProvider],
     naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+    groups: &[AggregateGroup],
 ) -> Result<(), String> {
     use crate::coding::codex::commands as codex_commands;
 
-    let config_dir = codex_commands::get_codex_config_dir_from_db_async(db).await?;
-    if !config_dir.exists() {
-        fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("Failed to create .codex directory: {e}"))?;
-    }
+    let config_dir = config_path.parent().ok_or_else(|| {
+        format!(
+            "Failed to determine Codex runtime directory from {}",
+            config_path.display()
+        )
+    })?;
 
     let site_specs = load_aggregate_site_specs(db, providers).await?;
-    let written = codex_commands::write_codex_aggregate_catalog(
-        &config_dir,
+    let written = codex_commands::write_codex_aggregate_catalog_with_groups(
+        config_dir,
         &site_specs,
         naming,
+        groups,
         codex_commands::CODEX_AGGREGATE_DEFAULT_CONTEXT_WINDOW,
     )?;
     if !written {
@@ -821,6 +987,7 @@ pub async fn disengage_failover_cli(
     // superset of "gateway proxy on", so leaving it must restore the P0-only
     // single-mode runtime config and drop the aggregate manifest block.
     if manifest.enabled && manifest.mode != GatewayProxyMode::Single {
+        let was_aggregate = manifest.mode == GatewayProxyMode::Aggregate;
         let primary_provider =
             load_proxyable_provider(db, cli_key, &manifest.primary_provider_id).await?;
         let mut targets = resolve_targets(db, cli_key).await?;
@@ -843,22 +1010,19 @@ pub async fn disengage_failover_cli(
             codex_auth_backup_content.as_deref(),
             codex_auth_preservation_enabled_for_cli(db, cli_key)?,
         )?;
+        if was_aggregate
+            && cli_key == GatewayCliKey::Codex
+            && codex_manifest_manages_aggregate_catalog_pointer(&manifest)
+        {
+            let config_path = required_target_path(&targets, CODEX_CONFIG_KIND)?;
+            let config_backup = backup_content(paths, cli_key, &manifest, CODEX_CONFIG_KIND)?;
+            restore_codex_model_catalog_pointer_from_backup(config_path, config_backup.as_deref())?;
+        }
         sync_manifest_managed_fields(&mut manifest, &targets);
         manifest.mode = GatewayProxyMode::Single;
         manifest.aggregate = None;
         manifest.updated_at = chrono::Utc::now().to_rfc3339();
         write_manifest(paths, cli_key, &manifest)?;
-
-        // Leaving aggregate mode must also retire the aggregated catalog,
-        // otherwise Codex would keep listing `<site>.<model>` slugs that no
-        // longer resolve through the manifest.
-        if cli_key == GatewayCliKey::Codex {
-            if let Ok(config_dir) =
-                crate::coding::codex::commands::get_codex_config_dir_from_db_async(db).await
-            {
-                let _ = crate::coding::codex::commands::remove_codex_aggregate_catalog(&config_dir);
-            }
-        }
     }
     Ok(cli_takeover_status(db, paths, cli_key, gateway_status).await)
 }
@@ -1315,6 +1479,14 @@ async fn proxy_details_for_manifest(
         aggregate_separator: aggregate.separator,
         aggregate_aliases: aggregate.aliases,
         aggregate_naming: aggregate.naming,
+        aggregate_groups: aggregate
+            .groups
+            .into_iter()
+            .map(|group| super::types::GatewayAggregateGroup {
+                id: group.id,
+                provider_ids: group.provider_ids,
+            })
+            .collect(),
     };
     match load_candidate_providers_with_settings_and_selection(db, cli_key, None, Some(&selection))
         .await
@@ -1478,26 +1650,88 @@ fn write_manifest(
     manifest: &CliProxyManifest,
 ) -> Result<(), String> {
     let manifest_path = paths.manifest_path(cli_key);
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
+    let parent = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "Failed to determine gateway manifest directory for {}",
+            manifest_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create gateway manifest directory {}: {}",
+            parent.display(),
+            error
+        )
+    })?;
+    let content = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("Failed to serialize gateway manifest: {error}"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "Failed to create temporary gateway manifest for {}: {}",
+            manifest_path.display(),
+            error
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .write_all(format!("{content}\n").as_bytes())
+        .and_then(|_| temporary.as_file_mut().flush())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| {
             format!(
-                "Failed to create gateway manifest directory {}: {}",
-                parent.display(),
+                "Failed to flush gateway manifest temporary file for {}: {}",
+                manifest_path.display(),
                 error
             )
         })?;
-    }
-    let content = serde_json::to_string_pretty(manifest)
-        .map_err(|error| format!("Failed to serialize gateway manifest: {error}"))?;
-    fs::write(&manifest_path, format!("{content}\n")).map_err(|error| {
+    temporary.persist(&manifest_path).map_err(|error| {
         format!(
-            "Failed to write gateway manifest {}: {}",
+            "Failed to atomically replace gateway manifest {}: {}",
             manifest_path.display(),
             error
         )
     })?;
     crate::coding::proxy_gateway::runtime::clear_gateway_provider_selection_cache();
     Ok(())
+}
+
+fn aggregate_takeover_error_with_rollback(
+    primary_error: String,
+    rollback_errors: Vec<String>,
+) -> String {
+    if rollback_errors.is_empty() {
+        primary_error
+    } else {
+        format!(
+            "{primary_error}; aggregate takeover rollback also failed: {}",
+            rollback_errors.join("; ")
+        )
+    }
+}
+
+fn rollback_aggregate_takeover(
+    cli_key: GatewayCliKey,
+    paths: &ProxyGatewayPaths,
+    targets: &CliProxyTargets,
+    manifest: &mut CliProxyManifest,
+    primary_error: String,
+) -> String {
+    let mut rollback_errors = Vec::new();
+    if let Err(rollback_error) = restore_gateway_config(cli_key, paths, targets, manifest) {
+        rollback_errors.push(format!(
+            "restore runtime configuration failed: {rollback_error}"
+        ));
+    }
+    manifest.enabled = false;
+    manifest.mode = GatewayProxyMode::Single;
+    manifest.aggregate = None;
+    manifest.updated_at = chrono::Utc::now().to_rfc3339();
+    if let Err(rollback_error) = write_manifest(paths, cli_key, manifest) {
+        rollback_errors.push(format!(
+            "persist disabled aggregate manifest failed: {rollback_error}"
+        ));
+    }
+    aggregate_takeover_error_with_rollback(primary_error, rollback_errors)
 }
 
 fn prepare_manifest(
@@ -1537,6 +1771,11 @@ fn prepare_manifest(
     manifest.primary_provider_id = primary_provider_id.to_string();
     manifest.base_origin = base_origin.to_string();
     manifest.updated_at = timestamp;
+    if mode != GatewayProxyMode::Aggregate {
+        // A direct/failover manifest must not expose a stale aggregate
+        // selection left by a previous aggregate takeover.
+        manifest.aggregate = None;
+    }
 
     let backup_dir = paths.backup_dir(cli_key);
     let mut files = Vec::new();
@@ -1780,7 +2019,16 @@ fn apply_gateway_config(
                 .iter_mut()
                 .find(|file| file.kind == CODEX_CONFIG_KIND)
             {
+                let manages_aggregate_catalog_pointer = target
+                    .managed_fields
+                    .iter()
+                    .any(|field| field == CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD);
                 target.managed_fields = codex_config_managed_fields_for_provider(&provider_id);
+                if manages_aggregate_catalog_pointer {
+                    target
+                        .managed_fields
+                        .push(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD.to_string());
+                }
             }
             patch_codex_auth(
                 required_target_path(targets, CODEX_AUTH_KIND)?,
@@ -1846,9 +2094,10 @@ fn restore_gateway_config(
             if should_delete_gateway_created_file(manifest, CODEX_CONFIG_KIND) {
                 delete_if_exists(config_path)?;
             } else {
-                restore_codex_config(
+                restore_codex_config_with_aggregate_catalog_pointer(
                     config_path,
                     backup_content(paths, cli_key, manifest, CODEX_CONFIG_KIND)?.as_deref(),
+                    codex_manifest_manages_aggregate_catalog_pointer(manifest),
                 )?;
             }
             let auth_path = required_target_path(targets, CODEX_AUTH_KIND)?;
@@ -2735,7 +2984,16 @@ fn restore_grok_config(path: &Path, backup_content: Option<&str>) -> Result<(), 
     write_toml_file(path, &current)
 }
 
+#[cfg(test)]
 fn restore_codex_config(path: &Path, backup_content: Option<&str>) -> Result<(), String> {
+    restore_codex_config_with_aggregate_catalog_pointer(path, backup_content, false)
+}
+
+fn restore_codex_config_with_aggregate_catalog_pointer(
+    path: &Path,
+    backup_content: Option<&str>,
+    restore_aggregate_catalog_pointer: bool,
+) -> Result<(), String> {
     let mut current = read_or_new_toml_document(path)?;
     let backup = backup_content
         .map(|content| parse_toml_document(content, "Codex gateway backup"))
@@ -2802,8 +3060,136 @@ fn restore_codex_config(path: &Path, backup_content: Option<&str>) -> Result<(),
         current["model_providers"][&provider_key] = provider_item;
     }
 
+    if restore_aggregate_catalog_pointer {
+        restore_codex_model_catalog_pointer_in_document(&mut current, backup.as_ref());
+    }
+
     remove_empty_toml_table(&mut current, "model_providers");
     write_toml_file(path, &current)
+}
+
+fn restore_codex_model_catalog_pointer_from_backup(
+    path: &Path,
+    backup_content: Option<&str>,
+) -> Result<(), String> {
+    restore_codex_model_catalog_pointer_from_backup_with_previous(path, backup_content).map(|_| ())
+}
+
+fn restore_codex_model_catalog_pointer_from_backup_with_previous(
+    path: &Path,
+    backup_content: Option<&str>,
+) -> Result<Option<Item>, String> {
+    let mut current = read_or_new_toml_document(path)?;
+    let original = current
+        .as_table()
+        .get(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+        .cloned();
+    let backup = backup_content
+        .map(|content| parse_toml_document(content, "Codex gateway backup"))
+        .transpose()?;
+    restore_codex_model_catalog_pointer_in_document(&mut current, backup.as_ref());
+    write_toml_file(path, &current).map(|_| original)
+}
+
+fn restore_codex_model_catalog_pointer_value(
+    path: &Path,
+    value: Option<&Item>,
+) -> Result<(), String> {
+    let mut current = read_or_new_toml_document(path)?;
+    match value.cloned() {
+        Some(value) => {
+            current[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] = value;
+        }
+        None => {
+            current
+                .as_table_mut()
+                .remove(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD);
+        }
+    }
+    write_toml_file(path, &current)
+}
+
+fn restore_aggregate_catalog_pointer_before_single_takeover(
+    paths: &ProxyGatewayPaths,
+    cli_key: GatewayCliKey,
+    targets: &CliProxyTargets,
+    primary_provider_id: &str,
+) -> Result<Option<CodexModelCatalogPointerRollback>, String> {
+    if cli_key != GatewayCliKey::Codex {
+        return Ok(None);
+    }
+    let Some(previous_manifest) = read_manifest_for_reengage(
+        paths,
+        cli_key,
+        GatewayProxyMode::Single,
+        primary_provider_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !previous_manifest.enabled
+        || previous_manifest.mode != GatewayProxyMode::Aggregate
+        || !codex_manifest_manages_aggregate_catalog_pointer(&previous_manifest)
+    {
+        return Ok(None);
+    }
+    if previous_manifest.primary_provider_id != primary_provider_id {
+        return Err(
+            "Restore direct mode before switching the primary Gateway proxy provider".to_string(),
+        );
+    }
+
+    let config_path = required_target_path(targets, CODEX_CONFIG_KIND)?.to_path_buf();
+    // Read the old backup before changing the live config. A missing or invalid
+    // backup therefore leaves the aggregate takeover untouched.
+    let config_backup = backup_content(paths, cli_key, &previous_manifest, CODEX_CONFIG_KIND)?;
+    let original = restore_codex_model_catalog_pointer_from_backup_with_previous(
+        &config_path,
+        config_backup.as_deref(),
+    )?;
+    Ok(Some(CodexModelCatalogPointerRollback {
+        path: config_path,
+        original,
+    }))
+}
+
+fn rollback_single_catalog_pointer_transition(
+    transition: Option<CodexModelCatalogPointerRollback>,
+    primary_error: String,
+) -> String {
+    let Some(transition) = transition else {
+        return primary_error;
+    };
+    match restore_codex_model_catalog_pointer_value(&transition.path, transition.original.as_ref())
+    {
+        Ok(()) => primary_error,
+        Err(error) => format!(
+            "{primary_error}; restoring the aggregate Codex model catalog pointer also failed: {error}"
+        ),
+    }
+}
+
+fn restore_codex_model_catalog_pointer_in_document(
+    current: &mut DocumentMut,
+    backup: Option<&DocumentMut>,
+) {
+    match backup
+        .and_then(|backup| {
+            backup
+                .as_table()
+                .get(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+        })
+        .cloned()
+    {
+        Some(original_pointer) => {
+            current[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] = original_pointer;
+        }
+        None => {
+            current
+                .as_table_mut()
+                .remove(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD);
+        }
+    }
 }
 
 fn patch_codex_auth(
@@ -3319,6 +3705,31 @@ fn path_to_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode;
+    use crate::coding::proxy_gateway::cli_proxy::manifest::AggregateManifestConfig;
+
+    #[test]
+    fn strict_group_provider_union_is_canonical_and_stable() {
+        let groups = vec![
+            AggregateGroup {
+                id: "group-a".to_string(),
+                provider_ids: vec!["first".to_string(), "shared".to_string()],
+            },
+            AggregateGroup {
+                id: "group-b".to_string(),
+                provider_ids: vec!["shared".to_string(), "last".to_string()],
+            },
+        ];
+
+        assert_eq!(
+            aggregate_group_provider_union(&groups),
+            vec![
+                "first".to_string(),
+                "shared".to_string(),
+                "last".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn data_directory_switch_requires_all_cli_takeovers_to_be_restored() {
@@ -3344,6 +3755,82 @@ mod tests {
         fs::write(paths.manifest_path(GatewayCliKey::Codex), "{broken").unwrap();
         assert!(ensure_data_dir_can_change(&paths).is_err());
     }
+
+    #[test]
+    fn write_manifest_replaces_existing_manifest_with_complete_json() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProxyGatewayPaths::new(temporary.path());
+        let cli_key = GatewayCliKey::Claude;
+        let mut manifest = CliProxyManifest::new(
+            cli_key,
+            "http://127.0.0.1:8080".into(),
+            "test".into(),
+            GatewayProxyMode::Single,
+            "provider-1".into(),
+        );
+
+        write_manifest(&paths, cli_key, &manifest).unwrap();
+        manifest.primary_provider_id = "provider-2".to_string();
+        write_manifest(&paths, cli_key, &manifest).unwrap();
+
+        let content = fs::read_to_string(paths.manifest_path(cli_key)).unwrap();
+        assert!(content.ends_with('\n'));
+        let persisted: CliProxyManifest = serde_json::from_str(&content).unwrap();
+        assert_eq!(persisted.primary_provider_id, "provider-2");
+    }
+
+    #[test]
+    fn aggregate_manifest_groups_project_to_public_status_dto() {
+        let mut manifest = CliProxyManifest::new(
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:8080".into(),
+            "test".into(),
+            GatewayProxyMode::Aggregate,
+            "provider-a".into(),
+        );
+        manifest.aggregate = Some(AggregateManifestConfig {
+            provider_ids: vec!["provider-a".to_string(), "provider-b".to_string()],
+            separator: ".".to_string(),
+            aliases: BTreeMap::new(),
+            naming: AggregateNamingMode::SiteModel,
+            groups: vec![AggregateGroup {
+                id: "fast".to_string(),
+                provider_ids: vec!["provider-a".to_string(), "provider-b".to_string()],
+            }],
+        });
+
+        let details = GatewayStatusProxyDetails::from_manifest(&manifest);
+        let aggregate = details.aggregate.expect("aggregate status projection");
+        assert_eq!(aggregate.groups.len(), 1);
+        assert_eq!(aggregate.groups[0].id, "fast");
+        assert_eq!(
+            aggregate.groups[0].provider_ids,
+            vec!["provider-a".to_string(), "provider-b".to_string()]
+        );
+
+        let serialized = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(
+            serialized["groups"][0]["provider_ids"],
+            serde_json::json!(["provider-a", "provider-b"])
+        );
+        assert!(serialized["groups"][0].get("providerIds").is_none());
+    }
+
+    #[test]
+    fn aggregate_takeover_error_preserves_rollback_failures() {
+        let error = aggregate_takeover_error_with_rollback(
+            "apply failed".to_string(),
+            vec![
+                "restore runtime configuration failed: restore failed".to_string(),
+                "persist disabled aggregate manifest failed: manifest failed".to_string(),
+            ],
+        );
+
+        assert!(error.contains("apply failed"));
+        assert!(error.contains("restore runtime configuration failed"));
+        assert!(error.contains("persist disabled aggregate manifest failed"));
+    }
+
     use serde_json::json;
 
     fn claude_test_provider(
@@ -3824,6 +4311,435 @@ command = "node"
             restored["mcp_servers"]["keep"]["command"].as_str(),
             Some("node")
         );
+    }
+
+    #[test]
+    fn aggregate_codex_manifest_manages_catalog_pointer_and_direct_restore_recovers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let original = r#"
+model_provider = "custom"
+model_catalog_json = "user-catalog.json"
+
+[model_providers.custom]
+base_url = "https://old.example.com/v1"
+"#;
+        write_text_file(&config_path, original).unwrap();
+
+        let mut targets = CliProxyTargets {
+            runtime_root: dir.path().to_path_buf(),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        mark_codex_aggregate_catalog_pointer_as_managed(&mut targets);
+        assert!(targets.files[0]
+            .managed_fields
+            .contains(&CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD.to_string()));
+
+        patch_codex_config(&config_path, "http://127.0.0.1:37123/openai/v1", false).unwrap();
+        let mut patched = parse_toml_file(&config_path).unwrap();
+        patched[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] =
+            value("ai-toolbox-codex-model-catalog.json");
+        write_toml_file(&config_path, &patched).unwrap();
+
+        restore_codex_config_with_aggregate_catalog_pointer(&config_path, Some(original), true)
+            .unwrap();
+        let restored = parse_toml_file(&config_path).unwrap();
+        assert_eq!(
+            restored[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD].as_str(),
+            Some("user-catalog.json")
+        );
+        assert_eq!(
+            restored["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://old.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn aggregate_codex_restore_removes_catalog_pointer_when_backup_had_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let original = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://old.example.com/v1"
+"#;
+        write_text_file(&config_path, original).unwrap();
+        patch_codex_config(&config_path, "http://127.0.0.1:37123/openai/v1", false).unwrap();
+        let mut patched = parse_toml_file(&config_path).unwrap();
+        patched[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] =
+            value("ai-toolbox-codex-model-catalog.json");
+        write_toml_file(&config_path, &patched).unwrap();
+
+        restore_codex_config_with_aggregate_catalog_pointer(&config_path, Some(original), true)
+            .unwrap();
+        let restored = parse_toml_file(&config_path).unwrap();
+        assert!(restored
+            .as_table()
+            .get(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+            .is_none());
+    }
+
+    #[test]
+    fn direct_single_reengage_from_aggregate_restores_pointer_before_new_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProxyGatewayPaths::new(dir.path().join("app-data"));
+        let config_path = dir.path().join("runtime").join("config.toml");
+        let original = r#"
+model_provider = "custom"
+model_catalog_json = "user-catalog.json"
+
+[model_providers.custom]
+base_url = "https://old.example.com/v1"
+"#;
+        write_text_file(&config_path, original).unwrap();
+
+        let mut aggregate_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        mark_codex_aggregate_catalog_pointer_as_managed(&mut aggregate_targets);
+        let aggregate_manifest = prepare_manifest(
+            &paths,
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:37123",
+            &aggregate_targets,
+            GatewayProxyMode::Aggregate,
+            "provider-1",
+        )
+        .unwrap()
+        .with_aggregate(
+            vec!["provider-1".to_string()],
+            ".".to_string(),
+            BTreeMap::new(),
+            crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode::default(),
+        );
+        write_manifest(&paths, GatewayCliKey::Codex, &aggregate_manifest).unwrap();
+
+        // Simulate the live aggregate config before the direct single re-engage.
+        patch_codex_config(&config_path, "http://127.0.0.1:37123/openai/v1", false).unwrap();
+        let mut aggregate_config = parse_toml_file(&config_path).unwrap();
+        aggregate_config[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] =
+            value("ai-toolbox-codex-model-catalog.json");
+        write_toml_file(&config_path, &aggregate_config).unwrap();
+
+        let single_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        let transition = restore_aggregate_catalog_pointer_before_single_takeover(
+            &paths,
+            GatewayCliKey::Codex,
+            &single_targets,
+            "provider-1",
+        )
+        .unwrap();
+        assert!(transition.is_some());
+        let restored_before_backup = parse_toml_file(&config_path).unwrap();
+        assert_eq!(
+            restored_before_backup[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD].as_str(),
+            Some("user-catalog.json")
+        );
+
+        let single_manifest = prepare_manifest(
+            &paths,
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:37123",
+            &single_targets,
+            GatewayProxyMode::Single,
+            "provider-1",
+        )
+        .unwrap();
+        assert!(
+            single_manifest.aggregate.is_none(),
+            "single-mode re-engage must not retain the previous aggregate selection"
+        );
+        let single_backup = backup_content(
+            &paths,
+            GatewayCliKey::Codex,
+            &single_manifest,
+            CODEX_CONFIG_KIND,
+        )
+        .unwrap()
+        .unwrap();
+        let single_backup = parse_toml_document(&single_backup, "single backup").unwrap();
+        assert_eq!(
+            single_backup[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD].as_str(),
+            Some("user-catalog.json")
+        );
+    }
+
+    #[test]
+    fn direct_single_reengage_from_aggregate_removes_missing_pointer_before_new_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProxyGatewayPaths::new(dir.path().join("app-data"));
+        let config_path = dir.path().join("runtime").join("config.toml");
+        let original = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://old.example.com/v1"
+"#;
+        write_text_file(&config_path, original).unwrap();
+
+        let mut aggregate_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        mark_codex_aggregate_catalog_pointer_as_managed(&mut aggregate_targets);
+        let aggregate_manifest = prepare_manifest(
+            &paths,
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:37123",
+            &aggregate_targets,
+            GatewayProxyMode::Aggregate,
+            "provider-1",
+        )
+        .unwrap()
+        .with_aggregate(
+            vec!["provider-1".to_string()],
+            ".".to_string(),
+            BTreeMap::new(),
+            crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode::default(),
+        );
+        write_manifest(&paths, GatewayCliKey::Codex, &aggregate_manifest).unwrap();
+
+        patch_codex_config(&config_path, "http://127.0.0.1:37123/openai/v1", false).unwrap();
+        let mut aggregate_config = parse_toml_file(&config_path).unwrap();
+        aggregate_config[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] =
+            value("ai-toolbox-codex-model-catalog.json");
+        write_toml_file(&config_path, &aggregate_config).unwrap();
+
+        let single_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        let transition = restore_aggregate_catalog_pointer_before_single_takeover(
+            &paths,
+            GatewayCliKey::Codex,
+            &single_targets,
+            "provider-1",
+        )
+        .unwrap();
+        assert!(transition.is_some());
+        let restored_before_backup = parse_toml_file(&config_path).unwrap();
+        assert!(restored_before_backup
+            .as_table()
+            .get(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+            .is_none());
+
+        let single_manifest = prepare_manifest(
+            &paths,
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:37123",
+            &single_targets,
+            GatewayProxyMode::Single,
+            "provider-1",
+        )
+        .unwrap();
+        let single_backup = backup_content(
+            &paths,
+            GatewayCliKey::Codex,
+            &single_manifest,
+            CODEX_CONFIG_KIND,
+        )
+        .unwrap()
+        .unwrap();
+        let single_backup = parse_toml_document(&single_backup, "single backup").unwrap();
+        assert!(single_backup
+            .as_table()
+            .get(CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD)
+            .is_none());
+    }
+
+    #[test]
+    fn direct_single_reengage_from_aggregate_missing_backup_keeps_aggregate_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProxyGatewayPaths::new(dir.path().join("app-data"));
+        let config_path = dir.path().join("runtime").join("config.toml");
+        write_text_file(
+            &config_path,
+            r#"
+model_provider = "custom"
+model_catalog_json = "ai-toolbox-codex-model-catalog.json"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:37123/openai/v1"
+"#,
+        )
+        .unwrap();
+
+        let mut aggregate_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        mark_codex_aggregate_catalog_pointer_as_managed(&mut aggregate_targets);
+        let aggregate_manifest = CliProxyManifest {
+            files: vec![CliProxyManifestFile {
+                kind: CODEX_CONFIG_KIND.to_string(),
+                path: path_to_string(&config_path),
+                existed: true,
+                backup_rel_path: format!("{CODEX_CONFIG_KIND}.bak"),
+                backup_sha256: None,
+                backup_size: None,
+                managed_fields: aggregate_targets.files[0].managed_fields.clone(),
+            }],
+            ..CliProxyManifest::new(
+                GatewayCliKey::Codex,
+                "http://127.0.0.1:37123".to_string(),
+                "2026-09-17T00:00:00Z".to_string(),
+                GatewayProxyMode::Aggregate,
+                "provider-1".to_string(),
+            )
+            .with_aggregate(
+                vec!["provider-1".to_string()],
+                ".".to_string(),
+                BTreeMap::new(),
+                crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode::default(),
+            )
+        };
+        write_manifest(&paths, GatewayCliKey::Codex, &aggregate_manifest).unwrap();
+
+        let single_targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![CliProxyTarget {
+                kind: CODEX_CONFIG_KIND,
+                path: config_path.clone(),
+                managed_fields: codex_config_managed_fields_for_provider("custom"),
+            }],
+        };
+        let error = restore_aggregate_catalog_pointer_before_single_takeover(
+            &paths,
+            GatewayCliKey::Codex,
+            &single_targets,
+            "provider-1",
+        )
+        .unwrap_err();
+        assert!(error.contains("Failed to read gateway backup"));
+
+        let untouched_config = parse_toml_file(&config_path).unwrap();
+        assert_eq!(
+            untouched_config[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD].as_str(),
+            Some("ai-toolbox-codex-model-catalog.json")
+        );
+        let persisted_manifest = read_manifest(&paths, GatewayCliKey::Codex)
+            .unwrap()
+            .unwrap();
+        assert!(persisted_manifest.enabled);
+        assert_eq!(persisted_manifest.mode, GatewayProxyMode::Aggregate);
+    }
+
+    #[test]
+    fn aggregate_catalog_pointer_write_failure_rolls_back_runtime_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProxyGatewayPaths::new(dir.path().join("gateway-data"));
+        let config_path = dir.path().join("runtime").join("config.toml");
+        let auth_path = dir.path().join("runtime").join("auth.json");
+        let original_config = r#"
+model_provider = "custom"
+model_catalog_json = "user-catalog.json"
+
+[model_providers.custom]
+base_url = "https://old.example.com/v1"
+"#;
+        write_text_file(&config_path, original_config).unwrap();
+        write_json_file(&auth_path, &json!({"OPENAI_API_KEY": "old"})).unwrap();
+        let mut targets = CliProxyTargets {
+            runtime_root: dir.path().join("runtime"),
+            is_wsl_direct: false,
+            files: vec![
+                CliProxyTarget {
+                    kind: CODEX_CONFIG_KIND,
+                    path: config_path.clone(),
+                    managed_fields: codex_config_managed_fields_for_provider("custom"),
+                },
+                CliProxyTarget {
+                    kind: CODEX_AUTH_KIND,
+                    path: auth_path,
+                    managed_fields: static_managed_fields(&CODEX_AUTH_MANAGED_FIELDS),
+                },
+            ],
+        };
+        mark_codex_aggregate_catalog_pointer_as_managed(&mut targets);
+        let mut manifest = prepare_manifest(
+            &paths,
+            GatewayCliKey::Codex,
+            "http://127.0.0.1:37123",
+            &targets,
+            GatewayProxyMode::Aggregate,
+            "provider-1",
+        )
+        .unwrap()
+        .with_aggregate(
+            vec!["provider-1".to_string()],
+            ".".to_string(),
+            BTreeMap::new(),
+            crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode::default(),
+        );
+
+        patch_codex_config(&config_path, "http://127.0.0.1:37123/openai/v1", false).unwrap();
+        let mut patched = parse_toml_file(&config_path).unwrap();
+        patched[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD] =
+            value("ai-toolbox-codex-model-catalog.json");
+        write_toml_file(&config_path, &patched).unwrap();
+        patch_codex_auth(
+            required_target_path(&targets, CODEX_AUTH_KIND).unwrap(),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let error = rollback_aggregate_takeover(
+            GatewayCliKey::Codex,
+            &paths,
+            &targets,
+            &mut manifest,
+            "Failed to write aggregate catalog pointer".to_string(),
+        );
+
+        assert_eq!(error, "Failed to write aggregate catalog pointer");
+        let restored = parse_toml_file(&config_path).unwrap();
+        assert_eq!(
+            restored[CODEX_MODEL_CATALOG_JSON_MANAGED_FIELD].as_str(),
+            Some("user-catalog.json")
+        );
+        let persisted = read_manifest(&paths, GatewayCliKey::Codex)
+            .unwrap()
+            .unwrap();
+        assert!(!persisted.enabled);
+        assert_eq!(persisted.mode, GatewayProxyMode::Single);
+        assert!(persisted.aggregate.is_none());
     }
 
     #[test]

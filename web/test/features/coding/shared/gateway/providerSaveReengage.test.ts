@@ -175,6 +175,45 @@ test('save provider reengage helper replays the aggregate selection, not single 
   ]);
 });
 
+test('save provider reengage helper forwards strict groups unchanged', async () => {
+  const calls: string[] = [];
+
+  await saveProviderWithGatewayReengage({
+    gatewayMode: 'aggregate',
+    aggregateConfig: {
+      providerIds: ['site-a', 'site-b'],
+      separator: '.',
+      groups: [
+        { id: 'general', provider_ids: ['site-a', 'site-b'] },
+        { id: 'vision', provider_ids: ['site-a'] },
+      ],
+    },
+    saveProvider: async () => {
+      calls.push('save');
+      return 'saved';
+    },
+    restoreDirect: async () => {
+      calls.push('restore');
+      return 'direct';
+    },
+    engageSingle: async () => 'single',
+    engageFailover: async () => 'failover',
+    engageAggregate: async (config) => {
+      calls.push(JSON.stringify(config.groups));
+      return 'aggregate';
+    },
+  });
+
+  assert.deepEqual(calls, [
+    'restore',
+    'save',
+    JSON.stringify([
+      { id: 'general', provider_ids: ['site-a', 'site-b'] },
+      { id: 'vision', provider_ids: ['site-a'] },
+    ]),
+  ]);
+});
+
 test('save provider reengage helper refuses aggregate without a selection', async () => {
   const calls: string[] = [];
 

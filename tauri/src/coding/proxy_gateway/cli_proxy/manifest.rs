@@ -3,8 +3,24 @@ use crate::coding::proxy_gateway::{
     types::{GatewayCliKey, GatewayProxyMode},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
+
+/// Maximum length accepted for a strict aggregate group id.
+pub const AGGREGATE_GROUP_ID_MAX_LEN: usize = 32;
+
+/// A strict aggregate group and the proxyable providers assigned to it.
+///
+/// Groups are intentionally kept as a manifest-level contract. Runtime
+/// routing may consume them separately, while an empty list preserves the
+/// historical aggregate behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AggregateGroup {
+    pub id: String,
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +38,10 @@ pub struct AggregateManifestConfig {
     /// How `(site, model)` pairs are named in the generated Codex catalog.
     #[serde(default)]
     pub naming: AggregateNamingMode,
+    /// Optional strict provider groups. An empty list keeps legacy aggregate
+    /// routing semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<AggregateGroup>,
 }
 
 fn default_aggregate_separator() -> String {
@@ -35,6 +55,7 @@ impl Default for AggregateManifestConfig {
             separator: default_aggregate_separator(),
             aliases: BTreeMap::new(),
             naming: AggregateNamingMode::default(),
+            groups: Vec::new(),
         }
     }
 }
@@ -59,6 +80,76 @@ pub fn validate_aggregate_separator(separator: &str) -> Result<(), String> {
     {
         return Err("Aggregate separator must not contain letters, digits, '_' or '-'".to_string());
     }
+    Ok(())
+}
+
+/// Validate one strict aggregate group id.
+pub fn validate_aggregate_group_id(group_id: &str) -> Result<(), String> {
+    if group_id.is_empty() {
+        return Err("Aggregate group id must not be empty".to_string());
+    }
+    if group_id.chars().count() > AGGREGATE_GROUP_ID_MAX_LEN {
+        return Err(format!(
+            "Aggregate group id must be at most {AGGREGATE_GROUP_ID_MAX_LEN} characters"
+        ));
+    }
+    if group_id
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+    {
+        return Err("Aggregate group id may only contain letters, digits, '_' or '-'".to_string());
+    }
+    Ok(())
+}
+
+/// Validate strict aggregate groups against the currently proxyable providers.
+///
+/// Provider ids may intentionally appear in more than one group. Duplicates
+/// within one group are rejected because they do not define a meaningful
+/// priority order.
+pub fn validate_aggregate_groups(
+    groups: &[AggregateGroup],
+    proxyable_provider_ids: &[String],
+) -> Result<(), String> {
+    let proxyable = proxyable_provider_ids.iter().collect::<BTreeSet<_>>();
+    let mut seen_group_ids = BTreeSet::new();
+
+    for group in groups {
+        validate_aggregate_group_id(&group.id)
+            .map_err(|error| format!("Aggregate group '{}': {error}", group.id))?;
+
+        let normalized_group_id = group.id.to_ascii_lowercase();
+        if !seen_group_ids.insert(normalized_group_id) {
+            return Err(format!(
+                "Aggregate group id '{}' is used more than once; group ids must be unique case-insensitively",
+                group.id
+            ));
+        }
+
+        if group.provider_ids.is_empty() {
+            return Err(format!(
+                "Aggregate group '{}' must contain at least one provider",
+                group.id
+            ));
+        }
+
+        let mut seen_provider_ids = BTreeSet::new();
+        for provider_id in &group.provider_ids {
+            if !proxyable.contains(provider_id) {
+                return Err(format!(
+                    "Provider '{provider_id}' in aggregate group '{}' is not available for Gateway proxy",
+                    group.id
+                ));
+            }
+            if !seen_provider_ids.insert(provider_id) {
+                return Err(format!(
+                    "Provider '{provider_id}' appears more than once in aggregate group '{}'",
+                    group.id
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -124,12 +215,27 @@ impl CliProxyManifest {
         aliases: BTreeMap<String, String>,
         naming: AggregateNamingMode,
     ) -> Self {
+        self = self.with_aggregate_groups(provider_ids, separator, aliases, naming, Vec::new());
+        self
+    }
+
+    /// Attach aggregate routing config with optional strict groups and switch
+    /// the manifest to aggregate mode.
+    pub fn with_aggregate_groups(
+        mut self,
+        provider_ids: Vec<String>,
+        separator: String,
+        aliases: BTreeMap<String, String>,
+        naming: AggregateNamingMode,
+        groups: Vec<AggregateGroup>,
+    ) -> Self {
         self.mode = GatewayProxyMode::Aggregate;
         self.aggregate = Some(AggregateManifestConfig {
             provider_ids,
             separator,
             aliases,
             naming,
+            groups,
         });
         self
     }
@@ -216,5 +322,68 @@ mod tests {
 
         assert!(parsed.aliases.is_empty());
         assert_eq!(parsed.naming, AggregateNamingMode::SiteModel);
+        assert!(parsed.groups.is_empty());
+    }
+
+    #[test]
+    fn aggregate_group_id_validation_enforces_charset_and_length() {
+        assert!(validate_aggregate_group_id("group-1").is_ok());
+        assert!(validate_aggregate_group_id("group_1").is_ok());
+        assert!(validate_aggregate_group_id("").is_err());
+        assert!(validate_aggregate_group_id("group 1").is_err());
+        assert!(validate_aggregate_group_id("group.1").is_err());
+        assert!(validate_aggregate_group_id(&"a".repeat(AGGREGATE_GROUP_ID_MAX_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn aggregate_groups_validate_provider_members_and_allow_cross_group_membership() {
+        let available = vec!["provider-a".to_string(), "provider-b".to_string()];
+        let groups = vec![
+            AggregateGroup {
+                id: "fast".to_string(),
+                provider_ids: vec!["provider-a".to_string()],
+            },
+            AggregateGroup {
+                id: "slow".to_string(),
+                provider_ids: vec!["provider-a".to_string(), "provider-b".to_string()],
+            },
+        ];
+
+        assert!(validate_aggregate_groups(&groups, &available).is_ok());
+    }
+
+    #[test]
+    fn aggregate_groups_reject_duplicate_ids_empty_groups_and_unknown_providers() {
+        let available = vec!["provider-a".to_string()];
+        assert!(validate_aggregate_groups(
+            &[
+                AggregateGroup {
+                    id: "Fast".to_string(),
+                    provider_ids: vec!["provider-a".to_string()],
+                },
+                AggregateGroup {
+                    id: "fast".to_string(),
+                    provider_ids: vec!["provider-a".to_string()],
+                },
+            ],
+            &available,
+        )
+        .is_err());
+        assert!(validate_aggregate_groups(
+            &[AggregateGroup {
+                id: "empty".to_string(),
+                provider_ids: Vec::new(),
+            }],
+            &available,
+        )
+        .is_err());
+        assert!(validate_aggregate_groups(
+            &[AggregateGroup {
+                id: "unknown".to_string(),
+                provider_ids: vec!["provider-b".to_string()],
+            }],
+            &available,
+        )
+        .is_err());
     }
 }

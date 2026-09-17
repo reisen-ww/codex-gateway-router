@@ -1,6 +1,6 @@
 use ai_toolbox_lib::coding::proxy_gateway::{
     aggregate_naming::AggregateNamingMode,
-    cli_proxy::manifest::CliProxyManifest,
+    cli_proxy::manifest::{AggregateGroup, CliProxyManifest},
     paths::ProxyGatewayPaths,
     types::{GatewayCliKey, GatewayProxyMode, ProxyGatewaySettings},
     ProxyGatewayState,
@@ -30,6 +30,25 @@ impl RunningAggregateGateway {
         mode: GatewayProxyMode,
         selected_sites: &[&str],
     ) -> Self {
+        Self::new_with_groups(providers, mode, selected_sites, &[])
+    }
+
+    fn new_with_groups(
+        providers: &[(&str, &str, &str, &[&str])],
+        mode: GatewayProxyMode,
+        selected_sites: &[&str],
+        groups: &[(&str, &[&str])],
+    ) -> Self {
+        Self::new_with_groups_and_model_rewrites(providers, mode, selected_sites, groups, &[])
+    }
+
+    fn new_with_groups_and_model_rewrites(
+        providers: &[(&str, &str, &str, &[&str])],
+        mode: GatewayProxyMode,
+        selected_sites: &[&str],
+        groups: &[(&str, &[&str])],
+        model_rewrites: &[(&str, &str, &str)],
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let db = SqliteDbState::in_memory_for_test().unwrap();
         db.with_conn(|connection| {
@@ -40,12 +59,16 @@ impl RunningAggregateGateway {
                 &json!({"proxy_mode": "direct"}),
             )?;
             for (index, (id, name, upstream_url, models)) in providers.iter().enumerate() {
-                db_put(
-                    connection,
-                    DbTable::CodexProvider,
-                    id,
-                    &codex_provider_record(name, upstream_url, models, index as i64),
-                )?;
+                let mut record = codex_provider_record(name, upstream_url, models, index as i64);
+                let rewrites = model_rewrites
+                    .iter()
+                    .filter(|(provider_id, _, _)| *provider_id == *id)
+                    .map(|(_, from, to)| json!({"from": from, "to": to}))
+                    .collect::<Vec<_>>();
+                if !rewrites.is_empty() {
+                    record["meta"]["modelRewrites"] = json!(rewrites);
+                }
+                db_put(connection, DbTable::CodexProvider, id, &record)?;
             }
             Ok::<_, String>(())
         })
@@ -68,15 +91,32 @@ impl RunningAggregateGateway {
                 .to_string(),
         );
         if mode == GatewayProxyMode::Aggregate {
-            manifest = manifest.with_aggregate(
-                selected_sites
-                    .iter()
-                    .map(|site| (*site).to_string())
-                    .collect(),
-                ".".to_string(),
-                std::collections::BTreeMap::new(),
-                AggregateNamingMode::default(),
-            );
+            let provider_ids = selected_sites
+                .iter()
+                .map(|site| (*site).to_string())
+                .collect();
+            let aliases = std::collections::BTreeMap::new();
+            let naming = AggregateNamingMode::default();
+            manifest = if groups.is_empty() {
+                manifest.with_aggregate(provider_ids, ".".to_string(), aliases, naming)
+            } else {
+                manifest.with_aggregate_groups(
+                    provider_ids,
+                    ".".to_string(),
+                    aliases,
+                    naming,
+                    groups
+                        .iter()
+                        .map(|(id, provider_ids)| AggregateGroup {
+                            id: (*id).to_string(),
+                            provider_ids: provider_ids
+                                .iter()
+                                .map(|provider_id| (*provider_id).to_string())
+                                .collect(),
+                        })
+                        .collect(),
+                )
+            };
         }
         fs::create_dir_all(paths.manifest_path(GatewayCliKey::Codex).parent().unwrap()).unwrap();
         fs::write(
@@ -381,6 +421,169 @@ async fn aggregate_model_not_found_on_site_a_fails_over_to_site_b_with_same_mode
         .unwrap()
         .expect("site B request should be captured");
     assert_eq!(captured_b["model"], "modelX");
+}
+
+#[tokio::test]
+async fn aggregate_bare_model_applies_provider_model_rewrite() {
+    let site_a = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let site_a_url = format!("http://{}", site_a.local_addr().unwrap());
+    let site_a_task = spawn_upstream_capture(site_a, 200, responses_success("modelX", "rewritten"));
+
+    let gateway = RunningAggregateGateway::new_with_groups_and_model_rewrites(
+        &[("siteA", "Site A", &site_a_url, &["modelX"])],
+        GatewayProxyMode::Aggregate,
+        &["siteA"],
+        &[],
+        &[("siteA", "modelX", "rewritten-model")],
+    );
+    let (status, bytes) = send_request(&gateway.url, "modelX").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+
+    let captured = tokio::time::timeout(REQUEST_TIMEOUT, site_a_task)
+        .await
+        .expect("rewritten aggregate request should arrive")
+        .unwrap()
+        .expect("rewritten aggregate request should be captured");
+    assert_eq!(captured["model"], "rewritten-model");
+}
+
+#[tokio::test]
+async fn strict_aggregate_group_fails_over_only_within_the_named_group() {
+    let group_a_first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_a_second = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_b_only = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_a_first_url = format!("http://{}", group_a_first.local_addr().unwrap());
+    let group_a_second_url = format!("http://{}", group_a_second.local_addr().unwrap());
+    let group_b_only_url = format!("http://{}", group_b_only.local_addr().unwrap());
+    let group_a_first_task =
+        spawn_upstream_capture(group_a_first, 404, model_not_found_response("modelX"));
+    let group_a_second_task = spawn_upstream_capture(
+        group_a_second,
+        200,
+        responses_success("modelX", "group A fallback"),
+    );
+    let group_b_only_task = spawn_upstream_capture(
+        group_b_only,
+        200,
+        responses_success("modelX", "unexpected group B"),
+    );
+
+    let gateway = RunningAggregateGateway::new_with_groups(
+        &[
+            (
+                "provider-a-1",
+                "Group A first",
+                &group_a_first_url,
+                &["modelX"],
+            ),
+            (
+                "provider-a-2",
+                "Group A second",
+                &group_a_second_url,
+                &["modelX"],
+            ),
+            (
+                "provider-b-1",
+                "Group B only",
+                &group_b_only_url,
+                &["modelX"],
+            ),
+        ],
+        GatewayProxyMode::Aggregate,
+        &["provider-a-1"],
+        &[
+            ("group-a", &["provider-a-1", "provider-a-2"]),
+            ("group-b", &["provider-b-1"]),
+        ],
+    );
+
+    let (status, bytes) = send_request(&gateway.url, "group-a.modelX").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    let response: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response["model"], "modelX");
+    assert_eq!(
+        response["output"][0]["content"][0]["text"],
+        "group A fallback"
+    );
+
+    let captured_first = tokio::time::timeout(REQUEST_TIMEOUT, group_a_first_task)
+        .await
+        .expect("first provider in group A should receive the request")
+        .unwrap()
+        .expect("first group A request should be captured");
+    assert_eq!(captured_first["model"], "modelX");
+    let captured_second = tokio::time::timeout(REQUEST_TIMEOUT, group_a_second_task)
+        .await
+        .expect("second provider in group A should receive the failover request")
+        .unwrap()
+        .expect("second group A request should be captured");
+    assert_eq!(captured_second["model"], "modelX");
+    assert_eq!(abort_if_idle(group_b_only_task).await, None);
+}
+
+#[tokio::test]
+async fn strict_aggregate_group_does_not_fall_back_to_another_group_after_exhaustion() {
+    let group_a_first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_a_second = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_b_only = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let group_a_first_url = format!("http://{}", group_a_first.local_addr().unwrap());
+    let group_a_second_url = format!("http://{}", group_a_second.local_addr().unwrap());
+    let group_b_only_url = format!("http://{}", group_b_only.local_addr().unwrap());
+    let group_a_first_task =
+        spawn_upstream_capture(group_a_first, 404, model_not_found_response("modelX"));
+    let group_a_second_task =
+        spawn_upstream_capture(group_a_second, 404, model_not_found_response("modelX"));
+    let group_b_only_task = spawn_upstream_capture(
+        group_b_only,
+        200,
+        responses_success("modelX", "must not be used"),
+    );
+
+    let gateway = RunningAggregateGateway::new_with_groups(
+        &[
+            (
+                "provider-a-1",
+                "Group A first",
+                &group_a_first_url,
+                &["modelX"],
+            ),
+            (
+                "provider-a-2",
+                "Group A second",
+                &group_a_second_url,
+                &["modelX"],
+            ),
+            (
+                "provider-b-1",
+                "Group B only",
+                &group_b_only_url,
+                &["modelX"],
+            ),
+        ],
+        GatewayProxyMode::Aggregate,
+        &["provider-a-1"],
+        &[
+            ("group-a", &["provider-a-1", "provider-a-2"]),
+            ("group-b", &["provider-b-1"]),
+        ],
+    );
+
+    let (status, bytes) = send_request(&gateway.url, "group-a.modelX").await;
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&bytes));
+    let response: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response["error"]["code"], "model_not_found");
+
+    assert!(tokio::time::timeout(REQUEST_TIMEOUT, group_a_first_task)
+        .await
+        .expect("first provider in group A should receive the request")
+        .unwrap()
+        .is_some());
+    assert!(tokio::time::timeout(REQUEST_TIMEOUT, group_a_second_task)
+        .await
+        .expect("second provider in group A should receive the failover request")
+        .unwrap()
+        .is_some());
+    assert_eq!(abort_if_idle(group_b_only_task).await, None);
 }
 
 #[tokio::test]

@@ -1083,8 +1083,8 @@ const ClaudeCodePage: React.FC = () => {
         restoreDirect: () => restoreProxyGatewayCliDirect('claude'),
         engageSingle: () => engageProxyGatewaySingle('claude', savedProviderId),
         engageFailover: () => engageProxyGatewayFailover('claude'),
-        engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-          engageProxyGatewayAggregate('claude', providerIds, separator, aliases, naming),
+        engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+          engageProxyGatewayAggregate('claude', providerIds, separator, aliases, naming, groups),
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           if (isLocalTemp) {

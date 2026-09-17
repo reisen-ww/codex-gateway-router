@@ -167,12 +167,22 @@ pub enum GatewayProxyMode {
 /// create a module cycle with `cli_proxy::manifest`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct GatewayAggregateGroup {
+    pub id: String,
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct GatewayAggregateConfig {
     pub provider_ids: Vec<String>,
     pub separator: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     pub naming: crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GatewayAggregateGroup>,
 }
 
 impl GatewayProxyMode {

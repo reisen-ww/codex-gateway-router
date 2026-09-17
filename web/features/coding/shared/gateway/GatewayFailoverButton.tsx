@@ -18,7 +18,10 @@ import {
   restoreDirectUnavailableHintKey,
   type GatewayProxyReason,
 } from './providerProtocol';
-import { buildGatewayAggregateModelSlug } from './gatewayAggregateConfig';
+import {
+  buildGatewayAggregateGroupModelSlug,
+  buildGatewayAggregateModelSlug,
+} from './gatewayAggregateConfig';
 import styles from './GatewayFailoverButton.module.less';
 
 type SupportedGatewayCliKey = Extract<GatewayCliKey, 'claude' | 'codex' | 'grok' | 'kimi' | 'gemini' | 'claude_desktop'>;
@@ -146,6 +149,8 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
   // shows for each (site, model) pair is the concrete thing to display.
   const aggregateSeparator = status?.aggregate?.separator ?? DEFAULT_AGGREGATE_SEPARATOR;
   const aggregateSiteIds = status?.aggregate?.provider_ids ?? [];
+  const aggregateGroups = status?.aggregate?.groups ?? [];
+  const strictAggregateActive = aggregateActive && aggregateGroups.length > 0;
 
   const handleOpen = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -293,11 +298,23 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
                   <>
                     <div>
                       <CheckCircle2 size={14} aria-hidden="true" />
-                      <span>{t('gateway.aggregate.effects.crossSiteList')}</span>
+                      <span>
+                        {t(
+                          strictAggregateActive
+                            ? 'gateway.aggregate.effects.strictGroupList'
+                            : 'gateway.aggregate.effects.crossSiteList',
+                        )}
+                      </span>
                     </div>
                     <div>
                       <ShieldCheck size={14} aria-hidden="true" />
-                      <span>{t('gateway.aggregate.effects.settingsManaged')}</span>
+                      <span>
+                        {t(
+                          strictAggregateActive
+                            ? 'gateway.aggregate.effects.strictSettingsManaged'
+                            : 'gateway.aggregate.effects.settingsManaged',
+                        )}
+                      </span>
                     </div>
                     <div>
                       <AlertTriangle size={14} aria-hidden="true" />
@@ -326,17 +343,25 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
                 )}
               </div>
 
-              {aggregateActive && aggregateSiteIds.length ? (
+              {aggregateActive && (aggregateGroups.length > 0 || aggregateSiteIds.length > 0) ? (
                 <div className={styles.priorityList}>
                   <span className={styles.targetTitle}>
-                    {t('gateway.aggregate.sites', { count: aggregateSiteIds.length })}
+                    {aggregateGroups.length > 0
+                      ? t('gateway.aggregate.groupsCount', { count: aggregateGroups.length })
+                      : t('gateway.aggregate.sites', { count: aggregateSiteIds.length })}
                   </span>
                   <div>
-                    {aggregateSiteIds.map((siteId) => (
-                      <code key={siteId}>
-                        {buildGatewayAggregateModelSlug(siteId, '<model>', aggregateSeparator)}
-                      </code>
-                    ))}
+                    {aggregateGroups.length > 0
+                      ? aggregateGroups.map((group) => (
+                          <code key={group.id}>
+                            {buildGatewayAggregateGroupModelSlug(group.id, '<model>')}
+                          </code>
+                        ))
+                      : aggregateSiteIds.map((siteId) => (
+                          <code key={siteId}>
+                            {buildGatewayAggregateModelSlug(siteId, '<model>', aggregateSeparator)}
+                          </code>
+                        ))}
                   </div>
                 </div>
               ) : null}

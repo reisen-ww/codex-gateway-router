@@ -83,6 +83,17 @@ Grok 还有 `/grok/v1` 的本地探测路由；正式模型请求当前只接受
 
 Claude Desktop 使用独立 `/claude-desktop` 前缀和自己的 provider 表，共用 Anthropic 入站语义。Kimi 的正式入口为 `/kimi/v1/chat/completions`；六类受支持 CLI 与所有有效模型入口的隐私覆盖见 §7.2。旧版 `/openai/v1/completions` 继续走 runtime 专用兼容，其 JSON/SSE 有效内容包含 `choices[].text`。
 
+#### 1.5.1 Aggregate 严格分组（Codex）
+
+Aggregate provider 选择是 runtime 语义，不改变 `source_protocol` / `target_protocol` 或 transformer 矩阵。`manifest.aggregate.groups` 非空时：
+
+- Codex catalog 和请求入口固定使用 `<group_id>.<upstream_model>`，即 `group.model` 形状与字面 `.`；它不是 legacy 的 `<site_id><separator><model>`，也不读取 `aliases`、`separator` 或 `naming` 模板。
+- 解析出的 group 决定唯一候选边界；只在该 group 的 `provider_ids` 内按声明顺序做 retry/failover。禁止跨 group、回退到未分组 provider，或把 `primary_provider_id` 当作 group 优先级。
+- provider 可出现在多个 group，供不同 group 复用；同一 group 内不得重复，group id 忽略大小写唯一，每组至少一个当前可代理 provider。
+- **只有** `groups` 缺失或为空数组时，保持 legacy aggregate 的站点/模型 slug、声明目录筛选和 fallback 语义；非空 `groups` 必须使用上面的严格组边界，不得把严格边界默认套到旧 manifest，也不得把 legacy fallback 带入严格模式。
+
+严格 group slug 选定 provider 后，仍按本节通用规则执行该 provider 的 target protocol、URL/header/auth、协议转换和 health 记账；strict group 不是新的 `AiProtocol`，也不能通过 providerType 或模型名称推断。当前源码若只有 manifest/DTO/前端预览证据，仍不足以证明请求级组内 failover 已实现；请求级证据由 `tauri/tests/coding/proxy_gateway/aggregate_routing_http.rs` 的 `strict_aggregate_group_fails_over_only_within_the_named_group` 与 `strict_aggregate_group_does_not_fall_back_to_another_group_after_exhaustion` 提供，分别覆盖组内重试和禁止跨组回退。
+
 ### 1.6 Responses streamed compaction 边界
 
 - Responses -> Responses：同协议 identity route 不创建 `ConversionRoute`，原始 SSE 字节直接透传，因此 `compaction` / `compaction_summary` 保真，但不经过 `StreamKernel`。
@@ -1158,7 +1169,7 @@ inferred provider：
 - Anthropic/Gemini 真实签名绑定对象不能静默修改；需要替换或还原时明确拒绝。Gemini functionCall 的默认兼容占位签名复用 transformer 的 `DEFAULT_GEMINI_THOUGHT_SIGNATURE` 识别，不代表真实绑定，也不豁免 thinking 文本或其他签名。Gemini thought/text/function 分通道，连续相同 delta 不能被累计前缀兼容逻辑吞掉。此约束不改现有 thinking/encrypted-content 整流开关。
 - 启用隐私不改变 WS 的协议能力判定，也不会将已建立连接上的处理错误伪装成握手 426。未知正文/二进制事件和不完整占位符产生本地失败，provider 健康不扣分，已收到 usage 仍保留。
 - WS 保护状态按轮次固定；关掉开关仍需拦截受保护旧轮次的重复事件。开启时，没有待处理请求的正文事件同样不能绕过关联检查。
-- 本地 HTTP 隐私错误按入站协议格式化：OpenAI `error.message/type/code`、Anthropic 顶层 `type:error`、Gemini 数字 code/status；非法 JSON、请求签名拒绝和响应还原失败都保持客户端可解析的 envelope。
+- 本地 HTTP 隐私错误和 schema/lossy 拒绝按入站协议格式化：OpenAI `error.message/type/code`（含 `param:null`）、Anthropic 顶层 `type:error`、Gemini 数字 `code=400` + `status=INVALID_ARGUMENT`；Codex `/responses/compact` 保持 Responses-shaped nested error。非法 JSON、请求签名拒绝和响应还原失败都保持客户端可解析的 envelope；上游真实 HTTP 400 仍分类为 `upstream_bad_request`，不与本地 `RequestSchema` 混淆。
 - 完全关闭后的新请求沿用既有兼容链路；旧上游历史不会被改写。引用过期映射或其它 provider 的 `previous_response_id` 需要新建会话。
 - 回归包括 `privacy/tests.rs`、`runtime/websocket/privacy_tests.rs`、`runtime/websocket/privacy_matrix_tests.rs`：七入口 × 四种目标协议 × 开关两态 × JSON/SSE/强制 SSE 聚合，以及本节 Ollama、legacy completion、协议错误和开启保护后的 WS 426→HTTP 往返。
 

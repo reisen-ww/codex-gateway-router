@@ -1,4 +1,4 @@
-import type { GatewayAggregateNamingMode } from '@/services';
+import type { GatewayAggregateGroup, GatewayAggregateNamingMode } from '@/services';
 
 export type GatewayReengageMode = 'single' | 'failover' | 'aggregate' | null | undefined;
 
@@ -8,6 +8,8 @@ export interface GatewayAggregateReengageConfig {
   separator: string;
   aliases?: Record<string, string>;
   naming?: GatewayAggregateNamingMode;
+  /** Empty for legacy aggregate manifests; non-empty enables strict groups. */
+  groups?: GatewayAggregateGroup[];
 }
 
 interface SaveProviderWithGatewayReengageOptions<TResult, TStatus> {

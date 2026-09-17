@@ -120,6 +120,13 @@
   min-height: 24px;
 }
 
+.listActions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
 .listTitle {
   display: inline-flex;
   align-items: center;
@@ -174,6 +181,86 @@
   & + & {
     margin-top: 4px;
   }
+}
+
+.groupList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.groupSection {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--color-border-card);
+  border-radius: 8px;
+  background: var(--color-bg-elevated);
+}
+
+.groupHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.groupNameField {
+  display: block;
+  min-width: 0;
+  flex: 1;
+}
+
+.groupNameInput {
+  width: min(100%, 220px);
+  min-width: 0;
+  padding: 4px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--color-border-secondary);
+  }
+
+  &[aria-invalid='true'] {
+    border-color: var(--color-status-error);
+  }
+}
+
+.groupAddRow {
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.groupAddLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+
+  .select {
+    max-width: min(100%, 280px);
+  }
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
 }
 
 .siteItem {
@@ -251,6 +338,16 @@
   &[aria-invalid='true'] {
     border-color: var(--color-status-error);
   }
+}
+
+.groupModelSlug {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .siteActions {
@@ -348,6 +445,17 @@
 
   .siteItem {
     grid-template-columns: auto auto minmax(0, 1fr) minmax(70px, 100px) auto;
+  }
+
+  .groupAddLabel {
+    align-items: flex-start;
+    flex-direction: column;
+    width: 100%;
+
+    .select {
+      width: 100%;
+      max-width: none;
+    }
   }
 
   .siteSlug {

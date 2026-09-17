@@ -4,9 +4,15 @@ import test from 'node:test';
 import type { GatewayCliTakeoverStatus } from '../../../../../services/proxyGatewayApi.ts';
 import {
   buildGatewayAggregateModelSlug,
+  createLatestGatewayAggregateOperationQueue,
+  flattenGatewayAggregateGroups,
   isAggregateSiteId,
+  normalizeGatewayAggregateAliases,
+  normalizeGatewayAggregateGroups,
+  normalizeGatewayAggregateSeparator,
   normalizeGatewayAggregateSiteIds,
   prepareGatewayAggregateAliasReengage,
+  pruneStaleGatewayAggregateAliases,
   resolveGatewayReengageMode,
   toGatewayAggregateReengageConfig,
   validateGatewayAggregateSeparator,
@@ -88,6 +94,145 @@ test('normalize keeps order, drops duplicates and unusable ids', () => {
   assert.deepEqual(normalizeGatewayAggregateSiteIds([]), []);
 });
 
+test('alias validation includes unselected addressable fallback sites', () => {
+  assert.equal(
+    normalizeGatewayAggregateAliases(
+      { 'site-a': 'site-b' },
+      ['site-a'],
+      ['site-a', 'site-b'],
+    ),
+    null,
+  );
+  assert.equal(
+    normalizeGatewayAggregateAliases(
+      { 'site-a': 'SITE-B' },
+      ['site-a'],
+      ['site-a', 'site-b'],
+    ),
+    null,
+  );
+  assert.deepEqual(
+    normalizeGatewayAggregateAliases(
+      { 'site-a': 'relay-a' },
+      ['site-a'],
+      ['site-a', 'site-b'],
+    ),
+    { 'site-a': 'relay-a' },
+  );
+});
+
+test('alias normalization fails closed for malformed persisted values', () => {
+  assert.equal(
+    normalizeGatewayAggregateAliases(
+      { 'site-a': 42 as unknown as string },
+      ['site-a'],
+      ['site-a'],
+    ),
+    null,
+  );
+});
+
+test('stale alias pruning preserves saved aliases until addressable sites are known', () => {
+  const aliases = {
+    'site-a': 'relay-a',
+    'stale-site': 'relay-stale',
+  };
+  assert.deepEqual(
+    pruneStaleGatewayAggregateAliases(aliases, ['site-a', 'stale-site']),
+    aliases,
+  );
+  assert.deepEqual(
+    pruneStaleGatewayAggregateAliases(aliases, ['site-a', 'stale-site'], ['site-a']),
+    { 'site-a': 'relay-a' },
+  );
+});
+
+test('strict groups allow one provider to participate in multiple groups', () => {
+  const groups = normalizeGatewayAggregateGroups(
+    [
+      { id: 'fast', provider_ids: ['site-a', 'site-b'] },
+      { id: 'vision', provider_ids: ['site-a'] },
+    ],
+    ['site-a', 'site-b'],
+  );
+  assert.deepEqual(groups, [
+    { id: 'fast', provider_ids: ['site-a', 'site-b'] },
+    { id: 'vision', provider_ids: ['site-a'] },
+  ]);
+  assert.deepEqual(flattenGatewayAggregateGroups(groups), ['site-a', 'site-b']);
+});
+
+test('strict groups fail closed for stale providers and duplicate names', () => {
+  assert.equal(
+    normalizeGatewayAggregateGroups(
+      [{ id: 'fast', provider_ids: ['site-a', 'missing-site'] }],
+      ['site-a'],
+    ),
+    null,
+  );
+  assert.equal(
+    normalizeGatewayAggregateGroups(
+      [
+        { id: 'fast', provider_ids: ['site-a'] },
+        { id: 'FAST', provider_ids: ['site-b'] },
+      ],
+      ['site-a', 'site-b'],
+    ),
+    null,
+  );
+  assert.equal(
+    normalizeGatewayAggregateGroups(
+      [{ id: 'fast', provider_ids: ['site-a', 'site-a'] }],
+      ['site-a', 'site-b'],
+    ),
+    null,
+  );
+});
+
+test('separator normalization mirrors backend trim and empty fallback semantics', () => {
+  assert.equal(normalizeGatewayAggregateSeparator('  ::  '), '::');
+  assert.equal(normalizeGatewayAggregateSeparator('\t.\n'), '.');
+  assert.equal(normalizeGatewayAggregateSeparator(' \t '), '.');
+  assert.equal(validateGatewayAggregateSeparator('  ::  '), null);
+  assert.equal(validateGatewayAggregateSeparator('  a  '), 'reservedCharacters');
+  assert.equal(validateGatewayAggregateSeparator(' \t '), 'empty');
+});
+
+test('latest aggregate operation queue serializes commands and marks stale work', async () => {
+  const queue = createLatestGatewayAggregateOperationQueue();
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let resolveFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+
+  const first = queue.enqueue(async (isCurrent) => {
+    events.push('first:start');
+    resolveFirstStarted();
+    await firstGate;
+    if (!isCurrent()) {
+      events.push('first:stale');
+      return 'stale';
+    }
+    events.push('first:apply');
+    return 'applied';
+  });
+  await firstStarted;
+  const second = queue.enqueue(async () => {
+    events.push('second:apply');
+    return 'applied';
+  });
+
+  releaseFirst();
+  assert.equal(await first, 'stale');
+  assert.equal(await second, 'applied');
+  assert.deepEqual(events, ['first:start', 'first:stale', 'second:apply']);
+});
+
 // ---- re-engage resolution --------------------------------------------------
 
 test('re-engage mode only accepts aggregate when its selection is complete', () => {
@@ -136,7 +281,89 @@ test('aggregate reengage config is only built for a valid aggregate manifest', (
         aggregate: { provider_ids: ['b', 'a', 'b'], separator: '::' },
       }),
     ),
-    { providerIds: ['b', 'a'], separator: '::', aliases: {}, naming: 'site_model' },
+    { providerIds: ['b', 'a'], separator: '::', aliases: {}, naming: 'site_model', groups: [] },
+  );
+  assert.equal(
+    toGatewayAggregateReengageConfig(
+      status({
+        mode: 'aggregate',
+        aggregate: {
+          provider_ids: ['site-a'],
+          separator: '.',
+          aliases: { 'site-a': 'site-b' },
+        },
+      }),
+      ['site-a', 'site-b'],
+    ),
+    null,
+  );
+  assert.equal(
+    toGatewayAggregateReengageConfig(
+      status({
+        mode: 'aggregate',
+        aggregate: {
+          provider_ids: ['site-a'],
+          separator: ' . ',
+          aliases: { 'site-a': 'site-b' },
+        },
+        provider_priorities: [
+          { provider_id: 'site-a', label: 'P0' },
+          { provider_id: 'site-b', label: 'P1' },
+        ],
+      }),
+    ),
+    null,
+  );
+  assert.deepEqual(
+    toGatewayAggregateReengageConfig(
+      status({
+        mode: 'aggregate',
+        aggregate: { provider_ids: ['site-a'], separator: ' . ' },
+      }),
+    ),
+    { providerIds: ['site-a'], separator: '.', aliases: {}, naming: 'site_model', groups: [] },
+  );
+  assert.deepEqual(
+    toGatewayAggregateReengageConfig(
+      status({
+        mode: 'aggregate',
+        aggregate: {
+          // Strict compatibility provider_ids are canonicalized from group
+          // order rather than trusting a stale/legacy flat ordering.
+          provider_ids: ['site-b', 'site-a'],
+          separator: '-',
+          aliases: { 'site-a': 'site-b' },
+          naming: 'model_only',
+          groups: [
+            { id: 'general', provider_ids: ['site-a', 'site-b'] },
+            { id: 'vision', provider_ids: ['site-a'] },
+          ],
+        },
+      }),
+    ),
+    {
+      providerIds: ['site-a', 'site-b'],
+      separator: '.',
+      aliases: {},
+      naming: 'site_model',
+      groups: [
+        { id: 'general', provider_ids: ['site-a', 'site-b'] },
+        { id: 'vision', provider_ids: ['site-a'] },
+      ],
+    },
+  );
+  assert.equal(
+    toGatewayAggregateReengageConfig(
+      status({
+        mode: 'aggregate',
+        aggregate: {
+          provider_ids: ['site-a'],
+          separator: '.',
+          groups: [{ id: 'empty', provider_ids: [] }],
+        },
+      }),
+    ),
+    null,
   );
 });
 

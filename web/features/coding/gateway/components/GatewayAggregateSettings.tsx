@@ -1,6 +1,6 @@
 import React from 'react';
 import { Switch } from 'antd';
-import { ArrowDown, ArrowUp, GripVertical, Loader2, Route } from 'lucide-react';
+import { ArrowDown, ArrowUp, GripVertical, Loader2, Plus, Route, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   DndContext,
@@ -26,17 +26,27 @@ import {
   getProxyGatewayCliStatuses,
   restoreProxyGatewayCliDirect,
   type GatewayCliKey,
+  type GatewayAggregateGroup,
   type GatewayAggregateNamingMode,
   type GatewayCliTakeoverStatus,
 } from '@/services';
 import { listCodexProviders } from '@/services/codexApi';
 import {
+  buildGatewayAggregateGroupModelSlug,
+  createLatestGatewayAggregateOperationQueue,
+  flattenGatewayAggregateGroups,
+  normalizeGatewayAggregateSeparator,
+  normalizeGatewayAggregateGroups,
+  pruneStaleGatewayAggregateAliases,
+  validateGatewayAggregateGroupId,
+} from '@/features/coding/shared/gateway/gatewayAggregateConfig';
+import {
   buildGatewayAggregateModelSlug,
   isAggregateSiteId,
+  isGatewayAggregateMode,
   moveAggregateSite,
   normalizeGatewayAggregateAliases,
   normalizeGatewayAggregateSiteIds,
-  reconcileAggregateSiteSelection,
   toAggregateSiteCandidates,
   validateGatewayAggregateSeparator,
   validateGatewayAggregateAlias,
@@ -80,6 +90,9 @@ interface SortableSiteRowProps {
   alias: string;
   onAliasChange: (siteId: string, alias: string) => void;
   onAliasCommit: () => void;
+  disabled: boolean;
+  aliasEditable?: boolean;
+  groupId?: string;
 }
 
 /**
@@ -96,10 +109,14 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
   alias,
   onAliasChange,
   onAliasCommit,
+  disabled,
+  aliasEditable = true,
+  groupId,
 }) => {
   const { t } = useTranslation();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: candidate.id,
+    disabled,
   });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -121,6 +138,7 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
       <input
         type="checkbox"
         checked
+        disabled={disabled}
         aria-label={candidate.name}
         onChange={(event) => onToggleSite(candidate.id, event.currentTarget.checked)}
       />
@@ -130,21 +148,28 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
       <code className={styles.siteSlug} title={candidate.id}>
         {candidate.id}
       </code>
-      <input
-        className={styles.aliasInput}
-        value={alias}
-        maxLength={32}
-        placeholder={t('gateway.aggregate.aliasPlaceholder')}
-        aria-label={`${candidate.name}: ${t('gateway.aggregate.alias')}`}
-        aria-invalid={alias.length > 0 && !validateGatewayAggregateAlias(alias)}
-        onChange={(event) => onAliasChange(candidate.id, event.currentTarget.value)}
-        onBlur={onAliasCommit}
-      />
+      {aliasEditable ? (
+        <input
+          className={styles.aliasInput}
+          value={alias}
+          disabled={disabled}
+          maxLength={32}
+          placeholder={t('gateway.aggregate.aliasPlaceholder')}
+          aria-label={`${candidate.name}: ${t('gateway.aggregate.alias')}`}
+          aria-invalid={alias.length > 0 && !validateGatewayAggregateAlias(alias)}
+          onChange={(event) => onAliasChange(candidate.id, event.currentTarget.value)}
+          onBlur={onAliasCommit}
+        />
+      ) : (
+        <code className={styles.groupModelSlug} title={groupId ? `${groupId}.model` : 'group.model'}>
+          {groupId ? `${groupId}.model` : 'group.model'}
+        </code>
+      )}
       <span className={styles.siteActions}>
         <button
           type="button"
           className={styles.iconButton}
-          disabled={index === 0}
+          disabled={disabled || index === 0}
           aria-label={`${candidate.name}: ${t('gateway.aggregate.moveUp')}`}
           onClick={() => onMoveSite(candidate.id, 'up')}
         >
@@ -153,7 +178,7 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
         <button
           type="button"
           className={styles.iconButton}
-          disabled={index === lastIndex}
+          disabled={disabled || index === lastIndex}
           aria-label={`${candidate.name}: ${t('gateway.aggregate.moveDown')}`}
           onClick={() => onMoveSite(candidate.id, 'down')}
         >
@@ -187,22 +212,49 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   const [separator, setSeparator] = React.useState<string>(DEFAULT_AGGREGATE_SEPARATOR);
   const [aliases, setAliases] = React.useState<Record<string, string>>({});
   const [naming, setNaming] = React.useState<GatewayAggregateNamingMode>('site_model');
+  const [groups, setGroups] = React.useState<GatewayAggregateGroup[]>([]);
   const [cliStatuses, setCliStatuses] = React.useState<GatewayCliTakeoverStatus[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<{ kind: 'error' | 'success'; text: string } | null>(
     null,
   );
   const revisionRef = React.useRef(0);
+  const statusRequestRef = React.useRef(0);
+  const mountedRef = React.useRef(true);
+  const operationQueueRef = React.useRef(createLatestGatewayAggregateOperationQueue());
 
   const selectedStatus = React.useMemo(
     () => cliStatuses.find((status) => status.cli_key === cliKey) ?? null,
     [cliKey, cliStatuses],
   );
-  const engaged = selectedStatus?.mode === 'aggregate';
+  const engaged = isGatewayAggregateMode(selectedStatus?.mode);
+  const strictGroups = groups.length > 0;
   const separatorError = validateGatewayAggregateSeparator(separator);
-  const normalizedAliases = normalizeGatewayAggregateAliases(aliases, siteIds);
+  const effectiveSeparator = normalizeGatewayAggregateSeparator(separator);
+  const addressableSiteIds = React.useMemo(
+    () => candidates.map((candidate) => candidate.id),
+    [candidates],
+  );
+  const normalizedGroups = normalizeGatewayAggregateGroups(groups, addressableSiteIds);
+  const groupedSiteIds = React.useMemo(
+    () => flattenGatewayAggregateGroups(groups),
+    [groups],
+  );
+  const normalizedAliases = normalizeGatewayAggregateAliases(
+    aliases,
+    siteIds,
+    addressableSiteIds,
+  );
+  const normalizedSiteIds = strictGroups
+    ? flattenGatewayAggregateGroups(normalizedGroups ?? [])
+    : normalizeGatewayAggregateSiteIds(siteIds);
   const canEngage =
-    running && siteIds.length > 0 && separatorError === null && normalizedAliases !== null && !busy;
+    running &&
+    normalizedSiteIds.length > 0 &&
+    (strictGroups
+      ? normalizedGroups !== null
+      : separatorError === null && normalizedAliases !== null) &&
+    !busy;
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -216,23 +268,37 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   );
 
   const refreshCliStatuses = React.useCallback(async () => {
+    const request = statusRequestRef.current + 1;
+    statusRequestRef.current = request;
     const statuses = await getProxyGatewayCliStatuses();
-    applyCliStatuses(statuses);
+    if (mountedRef.current && statusRequestRef.current === request) {
+      applyCliStatuses(statuses);
+    }
     return statuses;
   }, [applyCliStatuses]);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      revisionRef.current += 1;
+    };
+  }, []);
 
   // Seed the takeover state from the backend manifest so reopening the settings
   // page shows what is actually routing, not an empty form.
   React.useEffect(() => {
     let disposed = false;
+    const statusRequest = statusRequestRef.current + 1;
+    statusRequestRef.current = statusRequest;
     const load = async () => {
       try {
         const statuses = await getProxyGatewayCliStatuses();
-        if (!disposed) {
+        if (!disposed && mountedRef.current && statusRequestRef.current === statusRequest) {
           applyCliStatuses(statuses);
         }
       } catch {
-        if (!disposed) {
+        if (!disposed && mountedRef.current && statusRequestRef.current === statusRequest) {
           applyCliStatuses([]);
         }
       }
@@ -278,77 +344,149 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   // are no longer proxyable instead of showing them as still selected. Keyed on
   // the backend status so a re-engage round trip re-seeds the canonical list.
   React.useEffect(() => {
-    const saved = selectedStatus?.mode === 'aggregate' ? selectedStatus.aggregate ?? null : null;
+    const saved = selectedStatus && isGatewayAggregateMode(selectedStatus.mode)
+      ? selectedStatus.aggregate ?? null
+      : null;
+    const savedSeparator = saved?.separator
+      ? normalizeGatewayAggregateSeparator(saved.separator)
+      : DEFAULT_AGGREGATE_SEPARATOR;
     setSeparator(
-      saved?.separator && validateGatewayAggregateSeparator(saved.separator) === null
-        ? saved.separator
+      validateGatewayAggregateSeparator(savedSeparator) === null
+        ? savedSeparator
         : DEFAULT_AGGREGATE_SEPARATOR,
     );
-    setAliases(saved?.aliases ?? {});
     setNaming(saved?.naming ?? 'site_model');
+    const savedGroups = (saved?.groups ?? []).map((group) => ({
+      id: group.id,
+      provider_ids: [...group.provider_ids],
+    }));
+    const savedSiteIds = savedGroups.length > 0
+      ? flattenGatewayAggregateGroups(savedGroups)
+      : normalizeGatewayAggregateSiteIds(saved?.provider_ids ?? []);
+    setAliases(
+      savedGroups.length > 0
+        ? {}
+        : pruneStaleGatewayAggregateAliases(
+            saved?.aliases,
+            savedSiteIds,
+            loadingSites ? undefined : addressableSiteIds,
+          ),
+    );
+    setGroups(savedGroups);
     if (!saved) {
       setSiteIds([]);
       return;
     }
-    const { siteIds: nextSiteIds } = reconcileAggregateSiteSelection(
-      saved.provider_ids,
-      candidates,
-    );
-    setSiteIds(nextSiteIds);
-  }, [candidates, selectedStatus]);
+    // Keep stale ids in the draft so an unavailable provider/alias is visible
+    // and recoverable instead of silently deleting user configuration. In
+    // strict mode, the grouped order is the canonical compatibility order.
+    setSiteIds(savedSiteIds);
+  }, [addressableSiteIds, candidates, loadingSites, selectedStatus]);
+
+  const runGatewayOperation = React.useCallback(
+    async (
+      execute: () => Promise<unknown>,
+      successText: string,
+      failureKey: 'enableFailed' | 'disableFailed',
+    ) => {
+      setBusy(true);
+      setNotice(null);
+      await operationQueueRef.current.enqueue(async (isCurrent) => {
+        const isMountedAndCurrent = () => mountedRef.current && isCurrent();
+        try {
+          await execute();
+          if (!isMountedAndCurrent()) {
+            return;
+          }
+          await refreshCliStatuses();
+          if (!isMountedAndCurrent()) {
+            return;
+          }
+          onTakeoverChange?.();
+          setNotice({ kind: 'success', text: successText });
+        } catch (error) {
+          if (isMountedAndCurrent()) {
+            setNotice({
+              kind: 'error',
+              text: t(`gateway.aggregate.notice.${failureKey}`, { error: formatError(error) }),
+            });
+          }
+        } finally {
+          if (isMountedAndCurrent()) {
+            setBusy(false);
+          }
+        }
+      });
+    },
+    [onTakeoverChange, refreshCliStatuses, t],
+  );
 
   const runEngage = React.useCallback(
-    async (
+    (
       nextSiteIds: string[],
       nextSeparator: string,
       nextAliases: Record<string, string>,
       nextNaming: GatewayAggregateNamingMode,
-    ) => {
-      setBusy(true);
-      setNotice(null);
-      try {
-        await engageProxyGatewayAggregate(cliKey, nextSiteIds, nextSeparator, nextAliases, nextNaming);
-        await refreshCliStatuses();
-        onTakeoverChange?.();
-        setNotice({ kind: 'success', text: t('gateway.aggregate.notice.enabled') });
-      } catch (error) {
-        setNotice({
-          kind: 'error',
-          text: t('gateway.aggregate.notice.enableFailed', { error: formatError(error) }),
-        });
-      } finally {
-        setBusy(false);
-      }
-    },
-    [cliKey, onTakeoverChange, refreshCliStatuses, t],
+      nextGroups: GatewayAggregateGroup[] = [],
+    ) =>
+      runGatewayOperation(
+        () =>
+          engageProxyGatewayAggregate(
+            cliKey,
+            nextSiteIds,
+            nextSeparator,
+            nextAliases,
+            nextNaming,
+            nextGroups,
+          ),
+        t('gateway.aggregate.notice.enabled'),
+        'enableFailed',
+      ),
+    [cliKey, runGatewayOperation, t],
+  );
+
+  const runRestore = React.useCallback(
+    () =>
+      runGatewayOperation(
+        () => restoreProxyGatewayCliDirect(cliKey),
+        t('gateway.aggregate.notice.disabled'),
+        'disableFailed',
+      ),
+    [cliKey, runGatewayOperation, t],
   );
 
   const handleToggle = async (checked: boolean) => {
     setNotice(null);
     if (!checked) {
-      setBusy(true);
-      try {
-        await restoreProxyGatewayCliDirect(cliKey);
-        await refreshCliStatuses();
-        onTakeoverChange?.();
-        setNotice({ kind: 'success', text: t('gateway.aggregate.notice.disabled') });
-      } catch (error) {
-        setNotice({
-          kind: 'error',
-          text: t('gateway.aggregate.notice.disableFailed', { error: formatError(error) }),
-        });
-      } finally {
-        setBusy(false);
-      }
+      await runRestore();
       return;
     }
 
-    const normalizedSiteIds = normalizeGatewayAggregateSiteIds(siteIds);
-    if (normalizedSiteIds.length === 0) {
+    if (strictGroups) {
+      if (!normalizedGroups) {
+        setNotice({ kind: 'error', text: t('gateway.aggregate.groupsInvalid') });
+        return;
+      }
+      const nextSiteIds = flattenGatewayAggregateGroups(normalizedGroups);
+      if (nextSiteIds.length === 0) {
+        setNotice({ kind: 'error', text: t('gateway.aggregate.sitesRequired') });
+        return;
+      }
+      await runEngage(
+        nextSiteIds,
+        DEFAULT_AGGREGATE_SEPARATOR,
+        {},
+        'site_model',
+        normalizedGroups,
+      );
+      return;
+    }
+    const nextSiteIds = normalizeGatewayAggregateSiteIds(siteIds);
+    if (nextSiteIds.length === 0) {
       setNotice({ kind: 'error', text: t('gateway.aggregate.sitesRequired') });
       return;
     }
-    if (validateGatewayAggregateSeparator(separator) !== null) {
+    if (validateGatewayAggregateSeparator(effectiveSeparator) !== null) {
       setNotice({ kind: 'error', text: t('gateway.aggregate.notice.invalidConfig') });
       return;
     }
@@ -356,7 +494,13 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       setNotice({ kind: 'error', text: t('gateway.aggregate.aliasInvalid') });
       return;
     }
-    await runEngage(normalizedSiteIds, separator, normalizedAliases, naming);
+    await runEngage(
+      nextSiteIds,
+      effectiveSeparator,
+      normalizedAliases,
+      naming,
+      [],
+    );
   };
 
   const handleToggleSite = async (siteId: string, checked: boolean) => {
@@ -364,6 +508,11 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       ? normalizeGatewayAggregateSiteIds([...siteIds, siteId])
       : siteIds.filter((item) => item !== siteId);
     setSiteIds(nextSiteIds);
+    if (!checked && siteId in aliases) {
+      const nextAliases = { ...aliases };
+      delete nextAliases[siteId];
+      setAliases(nextAliases);
+    }
     // Auto-save: a running aggregate takeover must follow the new site list.
     if (!engaged) {
       return;
@@ -374,17 +523,27 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       await handleToggle(false);
       return;
     }
-    const nextAliases = normalizeGatewayAggregateAliases(aliases, nextSiteIds);
+    const nextAliases = normalizeGatewayAggregateAliases(
+      aliases,
+      nextSiteIds,
+      addressableSiteIds,
+    );
     if (separatorError === null && nextAliases) {
-      void runEngage(nextSiteIds, separator, nextAliases, naming);
+      void runEngage(nextSiteIds, effectiveSeparator, nextAliases, naming, []);
     }
   };
 
   const handleMoveSite = (siteId: string, direction: 'up' | 'down') => {
     const nextSiteIds = moveAggregateSite(siteIds, siteId, direction);
     setSiteIds(nextSiteIds);
-    if (engaged && nextSiteIds.length > 0 && separatorError === null && normalizedAliases) {
-      void runEngage(nextSiteIds, separator, normalizedAliases, naming);
+    if (
+      engaged &&
+      nextSiteIds.length > 0 &&
+      separatorError === null &&
+      normalizedAliases &&
+      !strictGroups
+    ) {
+      void runEngage(nextSiteIds, effectiveSeparator, normalizedAliases, naming, []);
     }
   };
 
@@ -400,32 +559,213 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     }
     const nextSiteIds = arrayMove(siteIds, oldIndex, newIndex);
     setSiteIds(nextSiteIds);
-    if (engaged && nextSiteIds.length > 0 && separatorError === null && normalizedAliases) {
-      void runEngage(nextSiteIds, separator, normalizedAliases, naming);
+    if (
+      engaged &&
+      nextSiteIds.length > 0 &&
+      separatorError === null &&
+      normalizedAliases &&
+      !strictGroups
+    ) {
+      void runEngage(nextSiteIds, effectiveSeparator, normalizedAliases, naming, []);
     }
   };
 
   const handleSeparatorCommit = () => {
-    if (validateGatewayAggregateSeparator(separator) !== null) {
+    if (validateGatewayAggregateSeparator(effectiveSeparator) !== null) {
       return;
     }
-    if (engaged && siteIds.length > 0 && normalizedAliases) {
-      void runEngage(siteIds, separator, normalizedAliases, naming);
+    setSeparator(effectiveSeparator);
+    if (engaged && !strictGroups && siteIds.length > 0 && normalizedAliases) {
+      void runEngage(siteIds, effectiveSeparator, normalizedAliases, naming, []);
     }
   };
 
   const handleAliasCommit = () => {
-    if (!engaged || siteIds.length === 0) {
+    if (!engaged || strictGroups || siteIds.length === 0) {
       return;
     }
-    const nextAliases = normalizeGatewayAggregateAliases(aliases, siteIds);
+    const nextAliases = normalizeGatewayAggregateAliases(
+      aliases,
+      siteIds,
+      addressableSiteIds,
+    );
     if (!nextAliases) {
       setNotice({ kind: 'error', text: t('gateway.aggregate.aliasInvalid') });
       return;
     }
     if (separatorError === null) {
-      void runEngage(siteIds, separator, nextAliases, naming);
+      void runEngage(siteIds, effectiveSeparator, nextAliases, naming, []);
     }
+  };
+
+  const reengageWithGroups = React.useCallback(
+    (
+      nextGroups: GatewayAggregateGroup[],
+      nextSiteIds: string[] = siteIds,
+      nextAliases: Record<string, string> = aliases,
+      nextNaming: GatewayAggregateNamingMode = naming,
+    ) => {
+      if (!engaged) return;
+      const normalizedGroupValues = normalizeGatewayAggregateGroups(
+        nextGroups,
+        addressableSiteIds,
+      );
+      if (nextGroups.length > 0) {
+        const normalizedSiteIds = flattenGatewayAggregateGroups(normalizedGroupValues ?? []);
+        if (normalizedSiteIds.length === 0 || !normalizedGroupValues) return;
+        void runEngage(
+          normalizedSiteIds,
+          DEFAULT_AGGREGATE_SEPARATOR,
+          {},
+          'site_model',
+          normalizedGroupValues,
+        );
+        return;
+      }
+
+      const normalizedSiteIds = normalizeGatewayAggregateSiteIds(nextSiteIds);
+      const normalizedAliasValues = normalizeGatewayAggregateAliases(
+        nextAliases,
+        normalizedSiteIds,
+        addressableSiteIds,
+      );
+      if (
+        normalizedSiteIds.length === 0 ||
+        separatorError !== null ||
+        !normalizedAliasValues
+      ) {
+        return;
+      }
+      void runEngage(
+        normalizedSiteIds,
+        effectiveSeparator,
+        normalizedAliasValues,
+        nextNaming,
+        [],
+      );
+    },
+    [
+      addressableSiteIds,
+      aliases,
+      effectiveSeparator,
+      engaged,
+      naming,
+      runEngage,
+      separatorError,
+      siteIds,
+    ],
+  );
+
+  const handleAddGroup = () => {
+    const used = new Set(groups.map((group) => group.id.toLowerCase()));
+    let index = groups.length + 1;
+    while (used.has(`group-${index}`)) index += 1;
+    // Converting an existing legacy selection should not make the selected
+    // sites disappear from the editor. New groups added after that start
+    // empty and can intentionally reuse providers from another group.
+    const initialProviderIds = groups.length === 0
+      ? normalizeGatewayAggregateSiteIds(siteIds)
+      : [];
+    const nextGroups = [...groups, { id: `group-${index}`, provider_ids: initialProviderIds }];
+    setGroups(nextGroups);
+    const nextSiteIds = flattenGatewayAggregateGroups(nextGroups);
+    setSiteIds(nextSiteIds);
+    setNotice(null);
+    if (engaged) {
+      reengageWithGroups(nextGroups, nextSiteIds);
+    }
+  };
+
+  const handleUseLegacyAggregate = () => {
+    const nextSiteIds = groupedSiteIds.length > 0
+      ? groupedSiteIds
+      : normalizeGatewayAggregateSiteIds(siteIds);
+    setGroups([]);
+    setSiteIds(nextSiteIds);
+    setNotice(null);
+    if (!engaged) return;
+    const nextAliases = normalizeGatewayAggregateAliases(
+      aliases,
+      nextSiteIds,
+      addressableSiteIds,
+    );
+    if (
+      nextSiteIds.length > 0 &&
+      separatorError === null &&
+      nextAliases
+    ) {
+      void runEngage(nextSiteIds, effectiveSeparator, nextAliases, naming, []);
+    }
+  };
+
+  const handleRemoveGroup = (groupId: string) => {
+    const nextGroups = groups.filter((group) => group.id !== groupId);
+    setGroups(nextGroups);
+    setSiteIds(nextGroups.length > 0
+      ? flattenGatewayAggregateGroups(nextGroups)
+      : groupedSiteIds);
+    reengageWithGroups(nextGroups);
+  };
+
+  const handleGroupIdChange = (groupId: string, id: string) => {
+    setGroups(groups.map((group) => (group.id === groupId ? { ...group, id } : group)));
+  };
+
+  const handleGroupIdCommit = () => {
+    const normalized = normalizeGatewayAggregateGroups(groups, addressableSiteIds);
+    if (!normalized) {
+      setNotice({ kind: 'error', text: t('gateway.aggregate.groupsInvalid') });
+      return;
+    }
+    setGroups(normalized);
+    reengageWithGroups(normalized);
+  };
+
+  const handleToggleGroupSite = (groupId: string, siteId: string, checked: boolean) => {
+    const nextGroups = groups.map((group) => {
+      if (group.id !== groupId) return group;
+      const provider_ids = checked
+        ? normalizeGatewayAggregateSiteIds([...group.provider_ids, siteId])
+        : group.provider_ids.filter((item) => item !== siteId);
+      return { ...group, provider_ids };
+    });
+    const nextSiteIds = flattenGatewayAggregateGroups(nextGroups);
+    setGroups(nextGroups);
+    setSiteIds(nextSiteIds);
+    reengageWithGroups(nextGroups, nextSiteIds);
+  };
+
+  const handleMoveGroupSite = (
+    groupId: string,
+    siteId: string,
+    direction: 'up' | 'down',
+  ) => {
+    const nextGroups = groups.map((group) =>
+      group.id === groupId
+        ? { ...group, provider_ids: moveAggregateSite(group.provider_ids, siteId, direction) }
+        : group,
+    );
+    setGroups(nextGroups);
+    setSiteIds(flattenGatewayAggregateGroups(nextGroups));
+    reengageWithGroups(nextGroups);
+  };
+
+  const handleGroupDragEnd = (groupId: string, event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const group = groups.find((item) => item.id === groupId);
+    if (!group) return;
+    const oldIndex = group.provider_ids.indexOf(String(active.id));
+    const newIndex = group.provider_ids.indexOf(String(over.id));
+    if (oldIndex < 0 || newIndex < 0) return;
+    const nextGroups = groups.map((item) =>
+      item.id === groupId
+        ? { ...item, provider_ids: arrayMove(item.provider_ids, oldIndex, newIndex) }
+        : item,
+    );
+    setGroups(nextGroups);
+    setSiteIds(flattenGatewayAggregateGroups(nextGroups));
+    reengageWithGroups(nextGroups);
   };
 
   const handleClearSelection = () => {
@@ -442,13 +782,27 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     .map((siteId) => candidates.find((candidate) => candidate.id === siteId))
     .filter((candidate): candidate is GatewayAggregateSiteCandidate => Boolean(candidate));
   const unselectedCandidates = candidates.filter((candidate) => !siteIds.includes(candidate.id));
-  const separatorExample = buildGatewayAggregateModelSlug(
-    aliases[candidates[0]?.id ?? ''] || candidates[0]?.id || 'site-id',
-    'model',
-    separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
-    naming,
-  );
+  const separatorExample = strictGroups
+    ? buildGatewayAggregateGroupModelSlug(groups[0]?.id || 'group', 'model')
+    : buildGatewayAggregateModelSlug(
+        aliases[candidates[0]?.id ?? ''] || candidates[0]?.id || 'site-id',
+        'model',
+        separatorError === null ? effectiveSeparator : DEFAULT_AGGREGATE_SEPARATOR,
+        naming,
+      );
+  const displayedNaming: GatewayAggregateNamingMode = strictGroups ? 'site_model' : naming;
+  const displayedSeparator = strictGroups ? DEFAULT_AGGREGATE_SEPARATOR : separator;
+  const namingHint = strictGroups
+    ? t('gateway.aggregate.strictNamingHint')
+    : t('gateway.aggregate.namingHint');
+  const separatorHint = strictGroups
+    ? t('gateway.aggregate.strictSeparatorHint')
+    : t('gateway.aggregate.separatorHint', { example: separatorExample });
   const invalidSiteIds = siteIds.filter((siteId) => !isAggregateSiteId(siteId));
+  const staleSiteIds = siteIds.filter((siteId) => !addressableSiteIds.includes(siteId));
+  const staleGroupSiteIds = groups.flatMap((group) =>
+    group.provider_ids.filter((siteId) => !addressableSiteIds.includes(siteId)),
+  );
 
   return (
     <div className={styles.settings}>
@@ -458,6 +812,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
           <select
             className={styles.select}
             value={cliKey}
+            disabled={busy}
             onChange={(event) => setCliKey(event.currentTarget.value as AggregateCliKey)}
           >
             {AGGREGATE_CLI_KEYS.map((option) => (
@@ -489,18 +844,25 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       <div className={styles.fieldRow}>
         <div className={styles.fieldMeta}>
           <span className={styles.fieldLabel}>{t('gateway.aggregate.naming')}</span>
-          <span className={styles.fieldHelp}>{t('gateway.aggregate.namingHint')}</span>
+          <span className={styles.fieldHelp}>{namingHint}</span>
         </div>
         <div className={styles.fieldControl}>
           <select
             className={styles.select}
-            value={naming}
+            value={displayedNaming}
+            disabled={busy || strictGroups}
             aria-label={t('gateway.aggregate.naming')}
             onChange={(event) => {
               const nextNaming = event.currentTarget.value as GatewayAggregateNamingMode;
               setNaming(nextNaming);
-              if (engaged && normalizedAliases && siteIds.length > 0) {
-                void runEngage(siteIds, separator, normalizedAliases, nextNaming);
+              if (engaged && normalizedAliases && normalizedGroups && siteIds.length > 0) {
+                void runEngage(
+                  siteIds,
+                  effectiveSeparator,
+                  normalizedAliases,
+                  nextNaming,
+                  normalizedGroups,
+                );
               }
             }}
           >
@@ -511,29 +873,30 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
         </div>
       </div>
 
-      <p className={styles.helper}>{t('gateway.aggregate.modeHint')}</p>
+      <p className={styles.helper}>
+        {strictGroups ? t('gateway.aggregate.groupsHint') : t('gateway.aggregate.modeHint')}
+      </p>
       {!running ? <p className={styles.helper}>{t('gateway.aggregate.takeoverHint')}</p> : null}
 
       <div className={styles.fieldRow}>
         <div className={styles.fieldMeta}>
           <span className={styles.fieldLabel}>{t('gateway.aggregate.separator')}</span>
-          <span className={styles.fieldHelp}>
-            {t('gateway.aggregate.separatorHint', { example: separatorExample })}
-          </span>
+          <span className={styles.fieldHelp}>{separatorHint}</span>
         </div>
         <div className={styles.fieldControl}>
           <input
             className={styles.separatorInput}
-            value={separator}
+            value={displayedSeparator}
+            disabled={busy || strictGroups}
             placeholder={t('gateway.aggregate.separatorPlaceholder')}
             aria-label={t('gateway.aggregate.separator')}
-            aria-invalid={separatorError !== null}
+            aria-invalid={strictGroups ? false : separatorError !== null}
             onChange={(event) => setSeparator(event.currentTarget.value)}
             onBlur={handleSeparatorCommit}
           />
         </div>
       </div>
-      {separatorError ? (
+      {separatorError && !strictGroups ? (
         <div className={styles.error} role="alert">
           {separatorError === 'empty'
             ? t('gateway.aggregate.separatorInvalidEmpty')
@@ -555,29 +918,178 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
           <div className={styles.listHeader}>
             <span className={styles.listTitle}>
               <Route size={12} aria-hidden="true" />
-              {t('gateway.aggregate.selectedCount', { count: siteIds.length })}
+              {strictGroups
+                ? t('gateway.aggregate.groupsCount', { count: groups.length })
+                : t('gateway.aggregate.selectedCount', { count: siteIds.length })}
             </span>
-            {siteIds.length > 0 ? (
+            <div className={styles.listActions}>
+              {strictGroups ? (
+                <button
+                  type="button"
+                  className={styles.textButton}
+                  disabled={busy}
+                  onClick={handleUseLegacyAggregate}
+                >
+                  {t('gateway.aggregate.useLegacy')}
+                </button>
+              ) : siteIds.length > 0 ? (
+                <button
+                  type="button"
+                  className={styles.textButton}
+                  disabled={busy}
+                  onClick={handleClearSelection}
+                >
+                  {t('gateway.aggregate.clearSelection')}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className={styles.textButton}
+                  disabled={busy}
+                  onClick={() => setSiteIds(candidates.map((candidate) => candidate.id))}
+                >
+                  {t('gateway.aggregate.selectAll')}
+                </button>
+              )}
               <button
                 type="button"
                 className={styles.textButton}
-                onClick={handleClearSelection}
+                disabled={busy}
+                onClick={handleAddGroup}
               >
-                {t('gateway.aggregate.clearSelection')}
+                <Plus size={13} aria-hidden="true" />
+                {strictGroups
+                  ? t('gateway.aggregate.addGroup')
+                  : t('gateway.aggregate.enableGroups')}
               </button>
-            ) : (
-              <button
-                type="button"
-                className={styles.textButton}
-                onClick={() => setSiteIds(candidates.map((candidate) => candidate.id))}
-              >
-                {t('gateway.aggregate.selectAll')}
-              </button>
-            )}
+            </div>
           </div>
 
+          {strictGroups ? (
+            <div className={styles.groupList} aria-label={t('gateway.aggregate.groups')}>
+              {groups.map((group) => {
+                const groupCandidates = group.provider_ids
+                  .map((siteId) =>
+                    candidates.find((candidate) => candidate.id === siteId) ?? {
+                      id: siteId,
+                      name: t('gateway.aggregate.staleProvider'),
+                    },
+                  );
+                const availableToAdd = candidates.filter(
+                  (candidate) => !group.provider_ids.includes(candidate.id),
+                );
+                const groupIdInvalid = !validateGatewayAggregateGroupId(group.id);
+                return (
+                  <section className={styles.groupSection} key={group.id}>
+                    <div className={styles.groupHeader}>
+                      <label className={styles.groupNameField}>
+                        <span className={styles.srOnly}>{t('gateway.aggregate.groupId')}</span>
+                        <input
+                          className={styles.groupNameInput}
+                          value={group.id}
+                          disabled={busy}
+                          maxLength={32}
+                          aria-label={t('gateway.aggregate.groupId')}
+                          aria-invalid={groupIdInvalid}
+                          onChange={(event) =>
+                            handleGroupIdChange(group.id, event.currentTarget.value)
+                          }
+                          onBlur={handleGroupIdCommit}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className={styles.iconButton}
+                        disabled={busy}
+                        aria-label={`${t('gateway.aggregate.removeGroup')}: ${group.id}`}
+                        title={t('gateway.aggregate.removeGroup')}
+                        onClick={() => handleRemoveGroup(group.id)}
+                      >
+                        <Trash2 size={13} aria-hidden="true" />
+                      </button>
+                    </div>
+                    {groupIdInvalid ? (
+                      <div className={styles.error} role="alert">
+                        {t('gateway.aggregate.groupIdInvalid')}
+                      </div>
+                    ) : null}
+                    <DndContext
+                      sensors={busy ? [] : sensors}
+                      collisionDetection={closestCenter}
+                      modifiers={[restrictToVerticalAxis]}
+                      onDragEnd={(event) => handleGroupDragEnd(group.id, event)}
+                    >
+                      <SortableContext
+                        items={group.provider_ids}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        <ul className={styles.siteList}>
+                          {groupCandidates.map((candidate, index) => (
+                            <SortableSiteRow
+                              key={`${group.id}:${candidate.id}`}
+                              candidate={candidate}
+                              index={index}
+                              lastIndex={groupCandidates.length - 1}
+                              onToggleSite={(siteId, checked) =>
+                                handleToggleGroupSite(group.id, siteId, checked)
+                              }
+                              onMoveSite={(siteId, direction) =>
+                                handleMoveGroupSite(group.id, siteId, direction)
+                              }
+                              disabled={busy}
+                              alias={aliases[candidate.id] ?? ''}
+                              onAliasChange={(siteId, alias) => {
+                                const nextAliases = { ...aliases, [siteId]: alias };
+                                if (!alias.trim()) delete nextAliases[siteId];
+                                setAliases(nextAliases);
+                              }}
+                              onAliasCommit={handleAliasCommit}
+                              aliasEditable={false}
+                              groupId={group.id}
+                            />
+                          ))}
+                        </ul>
+                      </SortableContext>
+                    </DndContext>
+                    <div className={styles.groupAddRow}>
+                      <label className={styles.groupAddLabel}>
+                        <span>{t('gateway.aggregate.addSiteToGroup')}</span>
+                        <select
+                          className={styles.select}
+                          value=""
+                          disabled={busy || availableToAdd.length === 0}
+                          aria-label={`${group.id}: ${t('gateway.aggregate.addSiteToGroup')}`}
+                          onChange={(event) => {
+                            const siteId = event.currentTarget.value;
+                            if (siteId) handleToggleGroupSite(group.id, siteId, true);
+                          }}
+                        >
+                          <option value="">
+                            {availableToAdd.length > 0
+                              ? t('gateway.aggregate.chooseSite')
+                              : t('gateway.aggregate.allSitesInGroup')}
+                          </option>
+                          {availableToAdd.map((candidate) => (
+                            <option key={candidate.id} value={candidate.id}>
+                              {candidate.name} ({candidate.id})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    {group.provider_ids.length === 0 ? (
+                      <div className={styles.error} role="alert">
+                        {t('gateway.aggregate.groupProvidersRequired')}
+                      </div>
+                    ) : null}
+                  </section>
+                );
+              })}
+            </div>
+          ) : (
+            <>
           <DndContext
-            sensors={sensors}
+            sensors={busy ? [] : sensors}
             collisionDetection={closestCenter}
             modifiers={[restrictToVerticalAxis]}
             onDragEnd={handleDragEnd}
@@ -592,6 +1104,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                     lastIndex={selectedCandidates.length - 1}
                     onToggleSite={handleToggleSite}
                     onMoveSite={handleMoveSite}
+                    disabled={busy}
                     alias={aliases[candidate.id] ?? ''}
                     onAliasChange={(siteId, alias) => {
                       const nextAliases = { ...aliases, [siteId]: alias };
@@ -612,6 +1125,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                   <input
                     type="checkbox"
                     checked={false}
+                    disabled={busy}
                     aria-label={candidate.name}
                     onChange={(event) =>
                       handleToggleSite(candidate.id, event.currentTarget.checked)
@@ -627,12 +1141,21 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
               ))}
             </ul>
           ) : null}
+            </>
+          )}
         </>
       )}
 
       {invalidSiteIds.length > 0 ? (
         <div className={styles.error} role="alert">
           {t('gateway.aggregate.notice.invalidConfig')}
+        </div>
+      ) : null}
+      {staleSiteIds.length > 0 || staleGroupSiteIds.length > 0 ? (
+        <div className={styles.error} role="alert">
+          {t('gateway.aggregate.staleProviderHint', {
+            providers: [...new Set([...staleSiteIds, ...staleGroupSiteIds])].join(', '),
+          })}
         </div>
       ) : null}
       {notice ? (

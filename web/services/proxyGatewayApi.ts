@@ -17,6 +17,13 @@ export type GatewayPricingModelSource = 'upstream' | 'requested';
 export type GatewayProxyMode = 'single' | 'failover' | 'aggregate';
 export type GatewayAggregateNamingMode = 'site_model' | 'model_at_site' | 'model_only';
 
+/** A strict aggregate group. Providers in one group share the `group.model`
+ * model namespace and are tried in the order listed here. */
+export interface GatewayAggregateGroup {
+  id: string;
+  provider_ids: string[];
+}
+
 /**
  * Aggregate-mode routing config. Every selected site becomes a candidate and
  * each request is routed by the model name the CLI asked for: the generated
@@ -32,6 +39,11 @@ export interface GatewayAggregateConfig {
   aliases?: Record<string, string>;
   /** Template used to name each selected `(site, model)` pair. */
   naming?: GatewayAggregateNamingMode;
+  /**
+   * Optional strict groups. Older manifests omit this field (or expose an
+   * empty array) and retain the legacy aggregate naming/routing behavior.
+   */
+  groups?: GatewayAggregateGroup[] | null;
 }
 
 /** Default separator between site id and upstream model name in aggregate mode. */
@@ -569,14 +581,28 @@ export const engageProxyGatewayAggregate = async (
   separator: string,
   aliases?: Record<string, string>,
   naming: GatewayAggregateNamingMode = 'site_model',
+  groups: GatewayAggregateGroup[] = [],
 ): Promise<GatewayCliTakeoverStatus> => {
-  return invoke<GatewayCliTakeoverStatus>('proxy_gateway_engage_aggregate', {
+  const payload: {
+    cliKey: GatewayCliKey;
+    providerIds: string[];
+    separator: string;
+    aliases: Record<string, string>;
+    naming: GatewayAggregateNamingMode;
+    groups?: GatewayAggregateGroup[];
+  } = {
     cliKey,
     providerIds,
     separator,
     aliases: aliases ?? {},
     naming,
-  });
+  };
+  // Keep the historical payload shape for legacy aggregate callers. A
+  // non-empty list is the opt-in strict-group contract.
+  if (groups.length > 0) {
+    payload.groups = groups;
+  }
+  return invoke<GatewayCliTakeoverStatus>('proxy_gateway_engage_aggregate', payload);
 };
 
 export const disengageProxyGatewayFailover = async (

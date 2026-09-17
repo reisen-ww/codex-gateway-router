@@ -715,8 +715,8 @@ const ClaudeDesktopPage: React.FC = () => {
         restoreDirect: () => restoreProxyGatewayCliDirect('claude_desktop'),
         engageSingle: () => engageProxyGatewaySingle('claude_desktop', savedProvider?.id || ''),
         engageFailover: () => engageProxyGatewayFailover('claude_desktop'),
-        engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-          engageProxyGatewayAggregate('claude_desktop', providerIds, separator, aliases, naming),
+        engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+          engageProxyGatewayAggregate('claude_desktop', providerIds, separator, aliases, naming, groups),
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           const category = values.category || editingProvider?.category || 'custom';

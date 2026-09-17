@@ -124,6 +124,21 @@ provider 读取在 `runtime/providers.rs`。`load_candidate_providers*()` 从对
 
 Copilot 是一个 runtime 特例：`effective_upstream_provider_for_request()` 会根据本次模型名把 Copilot provider 的 effective target protocol 动态切到 `OpenAiResponses` 或 `OpenAiChat`。这只影响本次请求，不改 provider 记录。Grok CLI 本身的入站协议固定为 OpenAI Responses；Grok provider 仍可通过 profile 选择其它上游 target，因此不能把 Grok CLI 路由和 xAI provider 方言混为一谈。
 
+### 4.1 Aggregate 模型命名与严格分组（Codex）
+
+Aggregate 是 runtime 的候选选择语义，不是新的 transformer protocol。manifest 的 `aggregate.groups` 有明确的兼容分界：
+
+| `aggregate.groups` | 模型入口命名 | provider 尝试范围 |
+|---|---|---|
+| 缺失或 `[]` | legacy `<site_id><separator><model>` / `model_at_site` / `model_only`，并保留旧的按声明目录筛选与 fallback | legacy aggregate 候选集合 |
+| 非空 | 固定 `<group_id>.<upstream_model>`（`group.model` 形状，字面 `.`） | 仅该 group 的 `provider_ids`，按列表顺序 failover |
+
+严格模式的 `group.model` **不是** legacy 的站点前缀，也不是 `aliases`、可配置 `separator` 或 `naming` 模板的另一种写法。解析必须先按已配置 group id 识别命名空间，再剥离唯一的 `.` 前缀得到上游模型名；不能再接受站点前缀、bare model 或其它 group 的 slug 作为同一请求的隐式回退。provider 可以出现在多个 group，便于不同模型组复用同一渠道；但同一 group 内不得重复，group id 忽略大小写唯一，每个 group 必须非空且只引用当前可代理 provider。
+
+严格模式只在被请求 group 内按 `provider_ids` 顺序重试；一次 provider 失败后不得跨到其它 group、未分组 provider 或 `primary_provider_id`。`primary_provider_id` 在 aggregate 里仍只是兼容字段/历史分桶，不是严格组的优先级。**只有** `groups` 缺失或为空数组时才允许 legacy aggregate 的站点/模型匹配与 fallback；不得把严格模式的组边界默认套到旧 manifest。
+
+当前源码证据分为两层：`cli_proxy/manifest.rs::validate_aggregate_groups` 负责 manifest 级约束，`runtime/providers.rs` 负责把选择载入并解析模型命名空间；请求级 provider attempt 仍必须由 `runtime/upstream.rs` 以 `group_id` 明确筛选并用组内回归证明。HTTP 黑盒回归位于 `tauri/tests/coding/proxy_gateway/aggregate_routing_http.rs`，由 `strict_aggregate_group_fails_over_only_within_the_named_group` 证明组内故障转移、由 `strict_aggregate_group_does_not_fall_back_to_another_group_after_exhaustion` 证明组耗尽后不会跨组回退。仅有 manifest/DTO/模型预览不构成端到端严格分组实现证据。
+
 ## 5. ConversionRoute 决策
 
 跨工具供应商分享由 `coding/deeplink` 适配配置字段，保持上游实际 `apiFormat`，不在分享层实现请求或 SSE 转换。导入目标的 native protocol 不匹配时，预览提示需要 Gateway；数据库记录保存对应 meta，启用后继续走本节的统一转换链路。内置 profile 只映射同一 profile/协议的目标 endpoint 引用，协议、SDK 地址和持久化边界见 [`deep-link-import.md`](deep-link-import.md)。
@@ -969,7 +984,7 @@ check_lossy_conversion(route, value) -> Vec<LossyConversionIssue>
 - 没有 issue：继续。
 - 有 issue 且 `lossy_rejection_enabled=false`：继续，并把 warnings 写入 `PreparedUpstreamBody.lossy_warnings`。
 - 有 issue 且 `lossy_rejection_enabled=true`，但请求头 `X-Allow-Lossy: true|1|yes`：继续，并同样写入 `PreparedUpstreamBody.lossy_warnings`。
-- 有 issue 且显式开启拒绝、请求头未绕过：返回本地 `RequestSchema` 错误。
+- 有 issue 且显式开启拒绝、请求头未绕过：返回本地 `RequestSchema` 错误；runtime 按客户端入站协议返回 envelope：Anthropic/Claude Desktop 为 `{type:"error",error:{...}}`，OpenAI Chat/Responses/Codex（含 `/responses/compact`）为嵌套 `error.message/type/code`，Gemini 为 `error.code=400,status=INVALID_ARGUMENT`，未知协议才回退旧 generic shape。该拒绝发生在发送前，不应伪装成 `UpstreamBadRequest`。
 
 允许通过的 lossy warning 会在最终响应 header 里追加：
 

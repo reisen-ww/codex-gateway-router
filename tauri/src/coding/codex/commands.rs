@@ -2808,6 +2808,83 @@ fn codex_catalog_model_specs(
     specs
 }
 
+/// Resolve one model id from a model-catalog/root-model row.
+///
+/// Codex provider records in the wild use both the canonical `model` field
+/// and the older `id`/`name` spellings.  Aggregate routing only needs the
+/// request model id, so strings are accepted as shorthand rows while object
+/// metadata is preserved when present.
+fn codex_model_id_from_aggregate_item(item: &Value) -> Option<String> {
+    match item {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        Value::Object(object) => [
+            object.get("model"),
+            object.get("id"),
+            object.get("name"),
+            object.get("modelId"),
+            object.get("model_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }),
+        _ => None,
+    }
+}
+
+/// Parse metadata from one aggregate model row after its model id has been
+/// resolved.  This is deliberately pure and does not apply provider-level
+/// auto-review fallback: strict groups use the first provider row as the
+/// metadata winner and only need model capability metadata here.
+fn codex_aggregate_model_spec_from_item(item: &Value, model: String) -> CodexCatalogModelSpec {
+    let object = item.as_object();
+    let string_field = |camel: &str, snake: &str| {
+        object
+            .and_then(|object| object.get(camel).or_else(|| object.get(snake)))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let string_array_field = |camel: &str, snake: &str| {
+        object
+            .and_then(|object| object.get(camel).or_else(|| object.get(snake)))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|items| !items.is_empty())
+    };
+
+    CodexCatalogModelSpec {
+        model,
+        display_name: string_field("displayName", "display_name"),
+        context_window: parse_codex_positive_u64(object.and_then(|object| {
+            object
+                .get("contextWindow")
+                .or_else(|| object.get("context_window"))
+        })),
+        auto_review_model_override: None,
+        reasoning_levels: string_array_field("reasoningLevels", "reasoning_levels"),
+        default_reasoning_level: string_field("defaultReasoningLevel", "default_reasoning_level"),
+        service_tiers: string_array_field("serviceTiers", "service_tiers"),
+    }
+}
+
 fn codex_model_catalog_entry(
     spec: &CodexCatalogModelSpec,
     index: usize,
@@ -3042,6 +3119,128 @@ fn codex_aggregate_catalog_entries(
     Ok(entries)
 }
 
+/// Collect a provider's declared upstream models for strict aggregate groups.
+///
+/// The source order is intentional and is shared with the runtime contract:
+/// `modelCatalog.models`, root `models`, then the provider's default `model`.
+/// A provider may repeat a model in more than one source; the first row wins
+/// its metadata.  The caller performs the group-scoped dedupe, so this helper
+/// only dedupes within one provider.
+fn codex_strict_aggregate_provider_models(settings_config: &Value) -> Vec<CodexCatalogModelSpec> {
+    let mut models = Vec::new();
+    let mut seen_models = BTreeSet::new();
+    let auto_review_model_override = settings_config
+        .as_object()
+        .and_then(resolve_codex_auto_review_model_override);
+
+    let mut append_item = |item: &Value| {
+        let Some(model) = codex_model_id_from_aggregate_item(item) else {
+            return;
+        };
+        if seen_models.insert(model.clone()) {
+            let mut spec = codex_aggregate_model_spec_from_item(item, model);
+            // This setting is provider-scoped, not row-scoped.  Every model
+            // emitted for this provider carries the same override; strict
+            // group dedupe below lets the highest-priority provider's
+            // metadata (including this field) win for shared models.
+            spec.auto_review_model_override = auto_review_model_override.clone();
+            models.push(spec);
+        }
+    };
+
+    if let Some(items) = settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            append_item(item);
+        }
+    }
+
+    if let Some(items) = settings_config.get("models").and_then(Value::as_array) {
+        for item in items {
+            append_item(item);
+        }
+    }
+
+    let config_toml = settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Some(model) = provider_protocol::codex_model_from_config(config_toml) {
+        append_item(&Value::String(model));
+    }
+
+    models
+}
+
+/// Build the strict-group catalog.  Group ids are the model namespace and
+/// therefore always use the canonical `<group>.<model>` slug, independent of
+/// the legacy site naming template/separator.
+///
+/// Providers are walked in each group's declared priority order.  A model is
+/// emitted at most once per group, and the first provider declaring it owns
+/// all catalog metadata for that group entry.  Providers outside a group are
+/// never consulted.
+fn codex_strict_aggregate_catalog_entries(
+    sites: &[(String, String, Value)],
+    groups: &[crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup],
+) -> Vec<AggregateCatalogEntry> {
+    let mut entries = Vec::new();
+
+    for group in groups {
+        let group_id = group.id.trim();
+        if group_id.is_empty() {
+            continue;
+        }
+        let mut seen_models = BTreeSet::new();
+
+        for provider_id in &group.provider_ids {
+            let Some((_, site_label, settings_config)) =
+                sites.iter().find(|(site_id, _, _)| site_id == provider_id)
+            else {
+                // Manifest validation normally prevents this.  The catalog
+                // writer stays fail-closed when a stale group references a
+                // provider that was not loaded for this takeover.
+                continue;
+            };
+
+            for spec in codex_strict_aggregate_provider_models(settings_config) {
+                if !seen_models.insert(spec.model.clone()) {
+                    continue;
+                }
+                let model_display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
+                entries.push(AggregateCatalogEntry {
+                    slug: format!("{group_id}.{}", spec.model),
+                    display_name: format!("{site_label} · {model_display_name}"),
+                    context_window: spec.context_window,
+                    reasoning_levels: spec.reasoning_levels,
+                    default_reasoning_level: spec.default_reasoning_level,
+                    service_tiers: spec.service_tiers,
+                    auto_review_model_override: spec.auto_review_model_override,
+                });
+            }
+        }
+    }
+
+    entries
+}
+
+/// Build aggregate catalog entries using the strict-group contract when groups
+/// are present, while preserving the exact legacy site×model path otherwise.
+fn codex_aggregate_catalog_entries_with_groups(
+    sites: &[(String, String, Value)],
+    naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+    groups: &[crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup],
+) -> Result<Vec<AggregateCatalogEntry>, String> {
+    if groups.is_empty() {
+        codex_aggregate_catalog_entries(sites, naming)
+    } else {
+        Ok(codex_strict_aggregate_catalog_entries(sites, groups))
+    }
+}
+
 /// Read the aggregate routing config (selected sites + separator) from the
 /// Codex gateway manifest.
 ///
@@ -3080,23 +3279,56 @@ pub(crate) fn read_codex_aggregate_selection(config_dir: &Path) -> Option<(Vec<S
 /// because aggregate routing only exists while the gateway is engaged.
 /// `providers` is `(site_id, site_label, settings_config)` in display order.
 ///
-/// Returns `Ok(true)` when an aggregate catalog was written.
+#[cfg(test)]
+/// Returns `Ok(true)` when an aggregate catalog was written and the current
+/// `config.toml` points Codex at it.
 pub(crate) fn write_codex_aggregate_catalog(
     config_dir: &Path,
     providers: &[(String, String, Value)],
     naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
     default_context_window: u64,
 ) -> Result<bool, String> {
-    let entries = codex_aggregate_catalog_entries(providers, naming)?;
+    write_codex_aggregate_catalog_with_groups(
+        config_dir,
+        providers,
+        naming,
+        &[],
+        default_context_window,
+    )
+}
+
+/// Write an aggregate catalog with optional strict provider groups.
+///
+/// An empty `groups` slice intentionally delegates to the legacy writer so
+/// manifests from before strict groups retain their exact catalog and naming
+/// behavior.
+pub(crate) fn write_codex_aggregate_catalog_with_groups(
+    config_dir: &Path,
+    providers: &[(String, String, Value)],
+    naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+    groups: &[crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup],
+    default_context_window: u64,
+) -> Result<bool, String> {
+    let entries = codex_aggregate_catalog_entries_with_groups(providers, naming, groups)?;
     if entries.is_empty() {
         return Ok(false);
     }
     let catalog = aggregate_catalog_from_entries(&entries, default_context_window);
+    let config_path = config_dir.join("config.toml");
+    let config_toml = fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read config.toml: {error}"))?;
+    // Keep the pointer mutation on the same authoritative structured-TOML
+    // path as ordinary provider catalog projection.
+    let updated_config_toml = set_codex_model_catalog_json_field(&config_toml, true)?;
     let catalog_path = config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
     let catalog_content = serde_json::to_string_pretty(&catalog)
         .map_err(|e| format!("Failed to serialize Codex model catalog: {}", e))?;
     fs::write(&catalog_path, catalog_content)
         .map_err(|e| format!("Failed to write Codex model catalog: {}", e))?;
+    if updated_config_toml != config_toml {
+        fs::write(&config_path, updated_config_toml)
+            .map_err(|error| format!("Failed to write config.toml: {error}"))?;
+    }
     Ok(true)
 }
 
@@ -3109,6 +3341,7 @@ pub(crate) const CODEX_AGGREGATE_DEFAULT_CONTEXT_WINDOW: u64 = CODEX_DEFAULT_CON
 /// `model_catalog_json` pointer decides whether Codex reads it. Leaving
 /// aggregate mode therefore only needs to remove the stale pointer; the file
 /// itself is rewritten by the next single-provider `apply`.
+#[cfg(test)]
 pub(crate) fn remove_codex_aggregate_catalog(config_dir: &Path) -> Result<(), String> {
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
@@ -4418,11 +4651,11 @@ pub async fn read_codex_settings(
 mod tests {
     use super::{
         aggregate_catalog_from_entries, append_toml_configs, build_written_codex_config_toml,
-        codex_aggregate_catalog_entries, codex_catalog_model_specs,
-        extract_codex_common_config_from_settings_toml, extract_provider_settings_for_storage,
-        fill_template_fields_from_static, heal_dangling_codex_model_provider,
-        infer_codex_provider_category_from_settings, merge_codex_auth_json,
-        merge_remote_codex_official_models, normalize_codex_model_tier,
+        codex_aggregate_catalog_entries, codex_aggregate_catalog_entries_with_groups,
+        codex_catalog_model_specs, extract_codex_common_config_from_settings_toml,
+        extract_provider_settings_for_storage, fill_template_fields_from_static,
+        heal_dangling_codex_model_provider, infer_codex_provider_category_from_settings,
+        merge_codex_auth_json, merge_remote_codex_official_models, normalize_codex_model_tier,
         prepare_codex_config_with_model_catalog, project_codex_auth_to_runtime_config,
         read_codex_aggregate_selection, remove_codex_aggregate_catalog,
         resolve_local_provider_meta, static_codex_official_models,
@@ -5158,6 +5391,147 @@ approval_policy = "never"
     }
 
     #[test]
+    fn strict_aggregate_catalog_uses_all_model_sources_and_first_provider_metadata() {
+        use crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup;
+
+        let sites = vec![
+            (
+                "first".to_string(),
+                "First".to_string(),
+                json!({
+                "modelCatalog": {
+                    "models": [
+                        {
+                            "model": "shared",
+                            "displayName": "First Shared",
+                                "contextWindow": 111000
+                            },
+                            { "model": "catalog-only" }
+                        ]
+                    },
+                    "models": [
+                        { "model": "root-only", "displayName": "First Root" }
+                    ],
+                    "autoReviewModelOverride": "first-reviewer",
+                    "config": "model = \"default-first\"\n"
+                }),
+            ),
+            (
+                "second".to_string(),
+                "Second".to_string(),
+                json!({
+                    "modelCatalog": {
+                        "models": [
+                            {
+                                "model": "shared",
+                                "displayName": "Second Shared",
+                                "contextWindow": 222000
+                            },
+                            { "model": "second-only" }
+                        ]
+                    },
+                    "models": [{ "model": "second-root-only" }],
+                    "autoReviewModelOverride": "second-reviewer",
+                    "config": "model = \"default-second\"\n"
+                }),
+            ),
+            aggregate_site("outside", "Outside", json!([{ "model": "outside-only" }])),
+        ];
+        let groups = vec![AggregateGroup {
+            id: "group-a".to_string(),
+            provider_ids: vec!["first".to_string(), "second".to_string()],
+        }];
+
+        let entries =
+            codex_aggregate_catalog_entries_with_groups(&sites, &aggregate_naming("@"), &groups)
+                .unwrap();
+        let slugs: Vec<&str> = entries.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "group-a.shared",
+                "group-a.catalog-only",
+                "group-a.root-only",
+                "group-a.default-first",
+                "group-a.second-only",
+                "group-a.second-root-only",
+                "group-a.default-second",
+            ]
+        );
+        assert!(!slugs.contains(&"group-a.outside-only"));
+
+        // Duplicate `shared` is kept once per group and its complete metadata
+        // comes from the first provider in the group's priority order.
+        assert_eq!(entries[0].display_name, "First · First Shared");
+        assert_eq!(entries[0].context_window, Some(111000));
+
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        assert_eq!(catalog["models"][0]["slug"], "group-a.shared");
+        assert_eq!(catalog["models"][0]["context_window"], 111000);
+        assert_eq!(
+            catalog["models"][0]["auto_review_model_override"],
+            "first-reviewer"
+        );
+        assert_eq!(
+            catalog["models"][4]["auto_review_model_override"],
+            "second-reviewer"
+        );
+    }
+
+    #[test]
+    fn strict_aggregate_catalog_keeps_same_model_in_each_group() {
+        use crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup;
+
+        let sites = vec![
+            aggregate_site("site-a", "Site A", json!([{ "model": "shared" }])),
+            aggregate_site("site-b", "Site B", json!([{ "model": "shared" }])),
+        ];
+        let groups = vec![
+            AggregateGroup {
+                id: "group-a".to_string(),
+                provider_ids: vec!["site-a".to_string()],
+            },
+            AggregateGroup {
+                id: "group-b".to_string(),
+                provider_ids: vec!["site-b".to_string()],
+            },
+        ];
+
+        let entries =
+            codex_aggregate_catalog_entries_with_groups(&sites, &aggregate_naming("/"), &groups)
+                .unwrap();
+        let slugs: Vec<&str> = entries.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["group-a.shared", "group-b.shared"]);
+    }
+
+    #[test]
+    fn empty_strict_groups_preserve_legacy_catalog_naming() {
+        use crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup;
+
+        let sites = vec![
+            aggregate_site("site-a", "Site A", json!([{ "model": "shared" }])),
+            aggregate_site("site-b", "Site B", json!([{ "model": "shared" }])),
+        ];
+        let legacy = codex_aggregate_catalog_entries(&sites, &aggregate_naming("@")).unwrap();
+        let via_empty_groups = codex_aggregate_catalog_entries_with_groups(
+            &sites,
+            &aggregate_naming("@"),
+            &Vec::<AggregateGroup>::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy.iter().map(|entry| &entry.slug).collect::<Vec<_>>(),
+            via_empty_groups
+                .iter()
+                .map(|entry| &entry.slug)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(via_empty_groups[0].slug, "site-a@shared");
+        assert_eq!(via_empty_groups[1].slug, "site-b@shared");
+    }
+
+    #[test]
     fn aggregate_catalog_entry_reuses_neutral_template_fields() {
         let sites = vec![aggregate_site(
             "site1",
@@ -5204,13 +5578,24 @@ approval_policy = "never"
     }
 
     #[test]
-    fn write_aggregate_catalog_writes_file_and_returns_true() {
+    fn write_aggregate_catalog_enables_relative_catalog_pointer() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let sites = vec![aggregate_site(
             "site1",
             "Site 1",
             json!([{ "model": "m1" }]),
         )];
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:37123/openai/v1"
+"#,
+        )
+        .unwrap();
 
         let written =
             write_codex_aggregate_catalog(&temp_dir.path(), &sites, &aggregate_naming("."), 200000)
@@ -5223,6 +5608,12 @@ approval_policy = "never"
         let catalog: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["slug"], "site1.m1");
+        let config = std::fs::read_to_string(config_path).unwrap();
+        let config: DocumentMut = config.parse().unwrap();
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME)
+        );
     }
 
     #[test]

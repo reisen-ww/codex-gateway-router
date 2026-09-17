@@ -13,8 +13,10 @@
 - 模型定价管理入口放在统计页筛选栏右侧，前端通过 `get_model_pricing_list` / `upsert_model_pricing` / `delete_model_pricing` 操作后端 `model_pricing` 表；手动“同步官方价格”只调用后端远端同步命令并刷新列表；每 CLI 默认计费配置通过 `ProxyGatewaySettings.app_configs` 保存，不另建前端本地状态源。
 - 请求详情优先以后端 JSONL 文件详情命令为准；`body`、`headers`、`response` 和 attempt/failover 过程只在详情文件里读取，不进入列表/统计状态。若详情文件不存在，后端可以用 SQLite 摘要降级返回基础字段，前端应继续把 body/header 显示为空态。
 - 模型健康度仍以后端本地文件状态为准，前端只能通过后端命令读取。
-- 聚合模式（第三种网关模式）的接管状态以后端 `manifest.aggregate` 为准：前端通过 `engageProxyGatewayAggregate(cliKey, providerIds, separator, aliases, naming)` 调用 `proxy_gateway_engage_aggregate`，**不自行持久化勾选站点、分隔符、别名或模板**，也不根据本地 state 推断当前模式。别名限 1–32 个 `[A-Za-z0-9_-]` 且忽略大小写唯一，且不能覆盖任何启用候选（包括未选中的兜底站点）provider id；三种模板为站点.模型、模型@站点、仅模型，后者同名由后端确定性显示为 `#2/#3`。修改后需重新接管，Codex 重启后刷新模型列表。模式判断统一走 `providerProtocol.ts` 的 `isGatewayProxyMode` / `isGatewayFailoverMode` / `isGatewayAggregateMode`，不要在组件里重写 `mode === 'single' || mode === 'failover'` 这类硬编码比较——那会把聚合模式误判成未接管。
-- `gatewayFailoverActive` 与聚合模式**语义不同**：aggregate 不是 failover 的一种。聚合模式下 `GatewayFailoverButton` 展示站点前缀说明并隐藏故障转移开关，只保留「恢复直连」，因为聚合没有 P0 主渠道可切、也没有单一渠道可故障转移。
+- 聚合模式（第三种网关模式）的接管状态以后端 `manifest.aggregate` 为准：前端通过 `engageProxyGatewayAggregate(cliKey, providerIds, separator, aliases, naming[, groups])` 调用 `proxy_gateway_engage_aggregate`，**不自行持久化勾选站点、分隔符、别名或模板**，也不根据本地 state 推断当前模式。`groups` 缺失或为空数组时才进入 legacy：别名限 1–32 个 `[A-Za-z0-9_-]` 且忽略大小写唯一，且不能覆盖任何启用候选（包括未选中的兜底站点）provider id；legacy 三种模板为站点.模型、模型@站点、仅模型，后者同名由后端确定性显示为 `#2/#3`。`groups` 非空时改用固定 `group.model` 形状，详见下一条。修改后需重新接管，Codex 重启后刷新模型列表。模式判断统一走 `providerProtocol.ts` 的 `isGatewayProxyMode` / `isGatewayFailoverMode` / `isGatewayAggregateMode`，不要在组件里重写 `mode === 'single' || mode === 'failover'` 这类硬编码比较——那会把聚合模式误判成未接管。
+- `gatewayFailoverActive` 与聚合模式**语义不同**：aggregate 不是 failover 的一种。legacy aggregate 下 `GatewayFailoverButton` 展示站点前缀说明；strict groups 下展示 `group.model` 组命名说明；两者都隐藏故障转移开关，只保留「恢复直连」，因为聚合没有 P0 主渠道可切、也没有单一渠道可故障转移。
+- 当 `manifest.aggregate.groups` 非空时，设置页必须以严格分组为唯一模型入口：预览和 catalog slug 使用 `<group_id>.<upstream_model>` 的固定 `group.model` 形状，字面分隔符始终是 `.`，不受 legacy `separator`、`aliases`、`naming` 影响；不得继续展示/生成站点前缀 slug 来代表严格组。每个 group id 需满足 `[A-Za-z0-9_-]`、最多 32 个字符、忽略大小写唯一且至少包含一个 provider；同一 provider 可出现在多个 group，但不可在同一 group 重复。UI 必须保留组内顺序，并将其表达为唯一 failover 顺序；不能把未分组 provider 或其它 group 的 provider 混入预览/错误转移说明。`groups` 缺失或为空数组时恢复 legacy aggregate UI 与 slug 行为。
+- 组配置的展示校验不能替代后端路由证据：`groups` 通过 DTO/表单传递并不表示 runtime 已执行组内 failover。若 backend 尚未返回组边界或回归未覆盖跨组/未分组失败，前端应按真实状态提示待验证，不得把 `group.model` 预览写成“已保证”的运行时行为。
 
 ## 核心设计决策（Why）
 

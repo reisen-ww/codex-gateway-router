@@ -23,8 +23,8 @@ use super::middleware::{
 };
 use super::pipeline::Pipeline;
 use super::providers::{
-    resolve_aggregate_route_with_selection, ProviderAuthStrategy, UpstreamModelMapping,
-    UpstreamProvider,
+    resolve_aggregate_route_with_selection, AggregateRoute, ProviderAuthStrategy,
+    UpstreamModelMapping, UpstreamProvider,
 };
 use super::routes::{build_target_url, match_gateway_route, split_request_target, GatewayRoute};
 use super::side_stores::{
@@ -41,8 +41,9 @@ use crate::coding::proxy_gateway::transformer::{
     ConversionContext, ConversionRoute,
 };
 use crate::coding::proxy_gateway::types::{
-    CodexChatReasoningMeta, GatewayCliKey, GatewayFailoverEvent, GatewayProviderAttempt,
-    GatewayProxyMode, GatewayStreamOutcome, ProviderGatewayMeta, ProviderModelHealthKey,
+    CodexChatReasoningMeta, GatewayAggregateGroup, GatewayCliKey, GatewayFailoverEvent,
+    GatewayProviderAttempt, GatewayProxyMode, GatewayStreamOutcome, ProviderGatewayMeta,
+    ProviderModelHealthKey,
 };
 use crate::coding::proxy_gateway::usage_parser::{
     from_response_body_with_provider_type, TokenUsage,
@@ -728,6 +729,52 @@ fn privacy_error_value(route: &GatewayRoute, status: u16, code: &str, message: &
     }
 }
 
+fn openai_request_schema_error_value(message: &str) -> Value {
+    json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "gateway_request_schema_rejected",
+        }
+    })
+}
+
+fn local_request_schema_error_value(
+    route: &GatewayRoute,
+    provider: &UpstreamProvider,
+    message: &str,
+) -> Value {
+    // `/v1/responses/compact` is a Codex facade even when its upstream target
+    // is Chat, Anthropic, or Gemini; keep its existing Responses-shaped error.
+    if let Some(value) =
+        CodexResponsesCompactCompat::new(route, provider).request_schema_error_value(message)
+    {
+        return value;
+    }
+
+    match source_protocol_from_route(route) {
+        Some(AiProtocol::AnthropicMessages) => json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": message,
+                "code": "gateway_request_schema_rejected",
+            }
+        }),
+        Some(AiProtocol::OpenAiChat | AiProtocol::OpenAiResponses) => {
+            openai_request_schema_error_value(message)
+        }
+        Some(AiProtocol::GeminiNative) => {
+            crate::coding::proxy_gateway::transformer::gemini_stream_error("400", message)
+        }
+        None => json!({
+            "error": "gateway_request_schema_rejected",
+            "message": message,
+        }),
+    }
+}
+
 pub(super) async fn route_request_with_options(
     request: &DebugHttpRequest,
     context: &GatewayRuntimeContext,
@@ -982,13 +1029,13 @@ async fn forward_to_upstream(
     }
     // Connectivity tests pin a provider and model; never rewrite those requests.
     let allow_provider_model_mapping = options.provider_override_id.is_none();
-    // Aggregate mode resolves the target site from the model prefix instead of
-    // from the manifest's primary provider. The prefix is authoritative, so the
-    // per-channel default/family mapping must not run for it.
-    let aggregate_selection = provider_candidates
-        .selection
-        .as_ref()
-        .filter(|selection| selection.mode == GatewayProxyMode::Aggregate);
+    // Aggregate mode resolves the target site from the model prefix when one is
+    // present instead of from the manifest's primary provider. An explicit
+    // prefix is authoritative, so per-channel mapping must not run for it;
+    // legacy bare models still allow exact provider model rewrites.
+    let aggregate_selection = provider_candidates.selection.as_ref().filter(|selection| {
+        selection.mode == GatewayProxyMode::Aggregate && options.provider_override_id.is_none()
+    });
     // Claude family + Codex default-model rewrite only run in failover mode.
     // Grok always rewrites when allowed (CLI takeover hardcodes model=grok-build).
     let apply_failover_model_mapping = allow_provider_model_mapping
@@ -1001,7 +1048,7 @@ async fn forward_to_upstream(
 
     // Aggregate mode: keep the site named by the model prefix first, and keep
     // the other sites that declare the same upstream model as fallbacks.
-    let mut aggregate_upstream_model: Option<String> = None;
+    let mut aggregate_route: Option<AggregateRoute> = None;
     if let Some(selection) = aggregate_selection {
         let resolved =
             match resolve_aggregate_route_with_selection(&requested_model, selection, &providers) {
@@ -1024,8 +1071,91 @@ async fn forward_to_upstream(
                     return response;
                 }
             };
-        aggregate_upstream_model = Some(resolved.upstream_model.clone());
-        if let Some(site_id) = resolved.site_id.as_deref() {
+        aggregate_route = Some(resolved.clone());
+        if let Some(group_id) = resolved.group_id.as_deref() {
+            // Strict aggregate mode is intentionally group-scoped. The group
+            // member list is the only source of candidates; in particular do
+            // not fall back to top-level aggregate_provider_ids, an ungrouped
+            // provider, or another group's providers when the group is
+            // unavailable or all its attempts fail.
+            let Some(group) = selection
+                .aggregate_groups
+                .iter()
+                .find(|group| group.id == group_id)
+            else {
+                let mut response = json_response(
+                    404,
+                    "Not Found",
+                    json!({
+                        "error": "gateway_aggregate_group_unknown",
+                        "message": format!(
+                            "No configured aggregate group named '{}' for {}.",
+                            group_id,
+                            route.cli_key.as_str(),
+                        ),
+                    }),
+                    route.route_name,
+                    None,
+                    "aggregate model prefix named a group that is not configured",
+                );
+                response.cli_key = Some(route.cli_key);
+                response.requested_model = Some(requested_model);
+                response.error_category = Some("provider_missing".to_string());
+                return response;
+            };
+
+            let group_candidates = aggregate_group_candidates(&providers, group);
+            if group_candidates.is_empty() {
+                let mut response = json_response(
+                    404,
+                    "Not Found",
+                    json!({
+                        "error": "gateway_aggregate_group_unavailable",
+                        "message": format!(
+                            "No enabled provider from aggregate group '{}' is available for {}.",
+                            group_id,
+                            route.cli_key.as_str(),
+                        ),
+                    }),
+                    route.route_name,
+                    None,
+                    "strict aggregate group has no enabled provider candidates",
+                );
+                response.cli_key = Some(route.cli_key);
+                response.requested_model = Some(requested_model);
+                response.error_category = Some("provider_missing".to_string());
+                return response;
+            }
+            // Keep failover model-aware inside the selected group. A provider
+            // whose non-empty catalog omits this model must not receive a
+            // request for a different model; providers with no catalog remain
+            // eligible as unknown-capability fallbacks. Unlike legacy
+            // aggregate routing, strict groups preserve the manifest's
+            // provider_ids order for both declared and unknown providers.
+            let group_providers =
+                strict_group_model_candidates(group_candidates, &resolved.upstream_model);
+            if group_providers.is_empty() {
+                let mut response = json_response(
+                    404,
+                    "Not Found",
+                    json!({
+                        "error": "gateway_aggregate_model_unknown",
+                        "message": format!(
+                            "No enabled aggregate provider in group '{}' declares model '{}'. Pick a model from the Codex model list.",
+                            group_id, resolved.upstream_model
+                        ),
+                    }),
+                    route.route_name,
+                    None,
+                    "strict aggregate group has no provider candidate for the requested model",
+                );
+                response.cli_key = Some(route.cli_key);
+                response.requested_model = Some(requested_model);
+                response.error_category = Some("model_not_found".to_string());
+                return response;
+            }
+            providers = group_providers;
+        } else if let Some(site_id) = resolved.site_id.as_deref() {
             let Some(index) = providers.iter().position(|provider| provider.id == site_id) else {
                 let mut response = json_response(
                     404,
@@ -1049,33 +1179,17 @@ async fn forward_to_upstream(
             };
             let target = providers.remove(index);
             // A fallback site only makes sense when it actually offers the same
-            // upstream model. Aggregate manifests declare the visible catalog,
-            // so do not send a model to sites with no matching declaration.
+            // upstream model. A non-empty aggregate catalog is authoritative;
+            // an empty catalog is unknown and is kept as the last fallback.
             let model = resolved.upstream_model.as_str();
-            let mut declaring = Vec::new();
-            for provider in providers {
-                if provider
-                    .meta
-                    .declared_models
-                    .iter()
-                    .any(|declared| declared == model)
-                {
-                    declaring.push(provider);
-                }
-            }
+            let declaring = aggregate_fallback_candidates(providers, model);
             let mut ordered = Vec::with_capacity(declaring.len() + 1);
             ordered.push(target);
             ordered.extend(declaring);
             providers = ordered;
         } else {
             let model = resolved.upstream_model.as_str();
-            providers.retain(|provider| {
-                provider
-                    .meta
-                    .declared_models
-                    .iter()
-                    .any(|declared| declared == model)
-            });
+            providers = aggregate_fallback_candidates(providers, model);
             if providers.is_empty() {
                 let mut response = json_response(
                     404,
@@ -1126,12 +1240,12 @@ async fn forward_to_upstream(
     let is_single_provider = providers.len() == 1;
 
     'providers: for provider in providers {
-        // Aggregate mode: the model prefix already named the exact upstream
-        // model, so forward it verbatim instead of running the per-channel
-        // default/family mapping.
-        let upstream_model_id = match aggregate_upstream_model.as_deref() {
-            Some(model) => model.to_string(),
-            None => resolve_upstream_model_id(
+        // An explicit aggregate prefix names the exact upstream model and must
+        // bypass per-channel mapping. A legacy bare model has no prefix, so its
+        // provider-specific modelRewrites still apply.
+        let upstream_model_id = match aggregate_route.as_ref() {
+            Some(route) if route.explicit => route.upstream_model.clone(),
+            _ => resolve_upstream_model_id(
                 request,
                 &requested_model,
                 &provider,
@@ -2401,6 +2515,90 @@ impl SseAggregateKind {
             Self::GeminiNative => "Gemini Native",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateCatalogMatch {
+    Declared,
+    Unknown,
+    NotDeclared,
+}
+
+fn aggregate_catalog_match(
+    provider: &UpstreamProvider,
+    requested_model: &str,
+) -> AggregateCatalogMatch {
+    if provider.meta.declared_models.is_empty() {
+        return AggregateCatalogMatch::Unknown;
+    }
+    if provider
+        .meta
+        .declared_models
+        .iter()
+        .any(|declared| declared == requested_model)
+    {
+        AggregateCatalogMatch::Declared
+    } else {
+        AggregateCatalogMatch::NotDeclared
+    }
+}
+
+fn aggregate_fallback_candidates(
+    providers: Vec<UpstreamProvider>,
+    requested_model: &str,
+) -> Vec<UpstreamProvider> {
+    let mut declaring = Vec::new();
+    let mut unknown_catalog = Vec::new();
+    for provider in providers {
+        match aggregate_catalog_match(&provider, requested_model) {
+            AggregateCatalogMatch::Declared => declaring.push(provider),
+            AggregateCatalogMatch::Unknown => unknown_catalog.push(provider),
+            AggregateCatalogMatch::NotDeclared => {}
+        }
+    }
+    declaring.extend(unknown_catalog);
+    declaring
+}
+
+fn strict_group_model_candidates(
+    providers: Vec<UpstreamProvider>,
+    requested_model: &str,
+) -> Vec<UpstreamProvider> {
+    providers
+        .into_iter()
+        .filter(|provider| {
+            !matches!(
+                aggregate_catalog_match(provider, requested_model),
+                AggregateCatalogMatch::NotDeclared
+            )
+        })
+        .collect()
+}
+
+/// Restrict strict aggregate routing to the providers explicitly assigned to
+/// one group, preserving the manifest order and ignoring duplicate ids.
+///
+/// The caller must not append top-level aggregate providers or providers from
+/// another group after this filtering step: the group membership is the
+/// complete candidate set for a strict `group.model` slug.
+fn aggregate_group_candidates(
+    providers: &[UpstreamProvider],
+    group: &GatewayAggregateGroup,
+) -> Vec<UpstreamProvider> {
+    let mut selected = Vec::with_capacity(group.provider_ids.len());
+    let mut seen = HashSet::new();
+    for provider_id in &group.provider_ids {
+        if !seen.insert(provider_id.as_str()) {
+            continue;
+        }
+        if let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.id == *provider_id)
+        {
+            selected.push(provider.clone());
+        }
+    }
+    selected
 }
 
 fn sse_aggregation_kind_for_non_streaming_client(
@@ -4564,14 +4762,7 @@ fn local_request_schema_failure_response(
     let body = if message.starts_with("privacy_") {
         privacy_error_value(route, 400, "privacy_request_blocked", &message)
     } else {
-        CodexResponsesCompactCompat::new(route, provider)
-            .request_schema_error_value(&message)
-            .unwrap_or_else(|| {
-                json!({
-                    "error": "gateway_request_schema_rejected",
-                    "message": message,
-                })
-            })
+        local_request_schema_error_value(route, provider, &message)
     };
     let mut response = json_response(
         400,
@@ -4594,6 +4785,7 @@ fn local_request_schema_failure_response(
     response.requested_model = Some(requested_model.to_string());
     response.upstream_model_id = Some(upstream_model_id.to_string());
     response.upstream_request_body = error.upstream_request_body;
+    response.source_protocol = source_protocol_from_route(route);
     response.target_protocol = Some(provider.target_protocol);
     response.upstream_response_body = error.upstream_response_body;
     response.upstream_response_body_bytes = error.upstream_response_body_bytes;
@@ -10881,6 +11073,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_fallback_candidates_keep_declared_matches_before_unknown_catalogs() {
+        let mut declared_match = provider_for_cli(GatewayCliKey::Codex);
+        declared_match.id = "declared-match".to_string();
+        declared_match.meta.declared_models = vec!["gpt-5".to_string()];
+
+        let mut declared_mismatch = provider_for_cli(GatewayCliKey::Codex);
+        declared_mismatch.id = "declared-mismatch".to_string();
+        declared_mismatch.meta.declared_models = vec!["claude-sonnet".to_string()];
+
+        let mut unknown_catalog = provider_for_cli(GatewayCliKey::Codex);
+        unknown_catalog.id = "unknown-catalog".to_string();
+
+        let candidates = aggregate_fallback_candidates(
+            vec![declared_mismatch, unknown_catalog, declared_match],
+            "gpt-5",
+        );
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["declared-match", "unknown-catalog"]);
+        assert_eq!(
+            aggregate_catalog_match(&candidates[0], "gpt-5"),
+            AggregateCatalogMatch::Declared
+        );
+        assert_eq!(
+            aggregate_catalog_match(&candidates[1], "gpt-5"),
+            AggregateCatalogMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn strict_group_candidates_exclude_other_groups_and_ungrouped_providers() {
+        let mut group_a_provider = provider_for_cli(GatewayCliKey::Codex);
+        group_a_provider.id = "group-a-provider".to_string();
+        group_a_provider.meta.declared_models = vec!["shared".to_string()];
+        let mut group_a_mismatch = provider_for_cli(GatewayCliKey::Codex);
+        group_a_mismatch.id = "group-a-mismatch".to_string();
+        group_a_mismatch.meta.declared_models = vec!["other".to_string()];
+        let mut group_b_provider = provider_for_cli(GatewayCliKey::Codex);
+        group_b_provider.id = "group-b-provider".to_string();
+        let mut ungrouped_provider = provider_for_cli(GatewayCliKey::Codex);
+        ungrouped_provider.id = "ungrouped-provider".to_string();
+
+        let group_a = GatewayAggregateGroup {
+            id: "group-a".to_string(),
+            provider_ids: vec![
+                "group-a-provider".to_string(),
+                "group-a-mismatch".to_string(),
+            ],
+        };
+        let candidates = aggregate_fallback_candidates(
+            aggregate_group_candidates(
+                &[
+                    group_a_provider,
+                    group_a_mismatch,
+                    group_b_provider,
+                    ungrouped_provider,
+                ],
+                &group_a,
+            ),
+            "shared",
+        );
+
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["group-a-provider"]);
+    }
+
+    #[test]
+    fn strict_group_candidates_preserve_provider_priority_when_catalog_is_unknown() {
+        let mut unknown_catalog = provider_for_cli(GatewayCliKey::Codex);
+        unknown_catalog.id = "unknown-catalog".to_string();
+        let mut declared_match = provider_for_cli(GatewayCliKey::Codex);
+        declared_match.id = "declared-match".to_string();
+        declared_match.meta.declared_models = vec!["shared".to_string()];
+        let mut declared_mismatch = provider_for_cli(GatewayCliKey::Codex);
+        declared_mismatch.id = "declared-mismatch".to_string();
+        declared_mismatch.meta.declared_models = vec!["other".to_string()];
+
+        let candidates = strict_group_model_candidates(
+            vec![unknown_catalog, declared_match, declared_mismatch],
+            "shared",
+        );
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["unknown-catalog", "declared-match"]);
+    }
+
     fn gateway_route(cli_key: GatewayCliKey, forwarded_path: &str) -> GatewayRoute {
         GatewayRoute {
             cli_key,
@@ -10954,7 +11242,7 @@ mod tests {
     }
 
     #[test]
-    fn request_schema_failure_returns_client_error_without_provider_attempt() {
+    fn openai_responses_schema_failure_returns_nested_error_without_provider_attempt() {
         let route = gateway_route(GatewayCliKey::Codex, "/v1/responses");
         let provider = provider_for_cli(GatewayCliKey::Codex);
         let response = local_request_schema_failure_response(
@@ -10976,10 +11264,80 @@ mod tests {
         assert_eq!(response.status_text, "Bad Request");
         assert_eq!(response.error_category.as_deref(), Some("request_schema"));
         assert!(response.provider_attempts.is_empty());
-        assert_eq!(body["error"], "gateway_request_schema_rejected");
-        assert!(body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Lossy protocol conversion rejected")));
+        assert_eq!(
+            body.pointer("/error/message").and_then(Value::as_str),
+            Some("Lossy protocol conversion rejected: /input/0: code_interpreter_call")
+        );
+        assert_eq!(
+            body.pointer("/error/type").and_then(Value::as_str),
+            Some("invalid_request_error")
+        );
+        assert!(body.pointer("/error/param").is_some_and(Value::is_null));
+        assert_eq!(
+            body.pointer("/error/code").and_then(Value::as_str),
+            Some("gateway_request_schema_rejected")
+        );
+        assert_eq!(response.source_protocol, Some(AiProtocol::OpenAiResponses));
+    }
+
+    #[test]
+    fn local_schema_failure_uses_client_protocol_envelopes_without_attempt() {
+        let message = "Lossy protocol conversion rejected: unsupported item";
+        let cases = [
+            (GatewayCliKey::Claude, "/v1/messages"),
+            (GatewayCliKey::ClaudeDesktop, "/v1/messages"),
+            (GatewayCliKey::Codex, "/v1/chat/completions"),
+            (
+                GatewayCliKey::Gemini,
+                "/v1beta/models/gemini-2.5-flash:generateContent",
+            ),
+        ];
+
+        for (cli_key, forwarded_path) in cases {
+            let route = gateway_route(cli_key, forwarded_path);
+            let provider = provider_for_cli(cli_key);
+            let response = local_request_schema_failure_response(
+                &route,
+                &provider,
+                "model",
+                "model",
+                GatewayForwardError::new(message, GatewayFailureKind::RequestSchema),
+                1,
+                1,
+                false,
+            );
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+            assert_eq!(response.status_code, 400);
+            assert_eq!(response.status_text, "Bad Request");
+            assert_eq!(response.error_category.as_deref(), Some("request_schema"));
+            assert!(
+                response.provider_attempts.is_empty(),
+                "{cli_key:?} must not report an upstream attempt"
+            );
+
+            match cli_key {
+                GatewayCliKey::Claude | GatewayCliKey::ClaudeDesktop => {
+                    assert_eq!(body["type"], "error");
+                    assert_eq!(body["error"]["type"], "invalid_request_error");
+                    assert_eq!(body["error"]["message"], message);
+                    assert_eq!(body["error"]["code"], "gateway_request_schema_rejected");
+                }
+                GatewayCliKey::Codex => {
+                    assert_eq!(body["error"]["type"], "invalid_request_error");
+                    assert_eq!(body["error"]["message"], message);
+                    assert_eq!(body["error"]["code"], "gateway_request_schema_rejected");
+                    assert!(body["error"]["param"].is_null());
+                }
+                GatewayCliKey::Gemini => {
+                    assert_eq!(body["error"]["code"], 400);
+                    assert_eq!(body["error"]["message"], message);
+                    assert_eq!(body["error"]["status"], "INVALID_ARGUMENT");
+                }
+                _ => unreachable!("test matrix only contains supported client protocols"),
+            }
+            assert_eq!(response.source_protocol, source_protocol_from_route(&route));
+        }
     }
 
     #[test]
@@ -11007,6 +11365,7 @@ mod tests {
         assert_eq!(response.status_code, 400);
         assert_eq!(response.status_text, "Bad Request");
         assert_eq!(response.error_category.as_deref(), Some("request_schema"));
+        assert!(response.provider_attempts.is_empty());
         assert_eq!(
             body.pointer("/error/message").and_then(Value::as_str),
             Some("Codex Responses compact compatibility does not support streaming requests")
@@ -11019,6 +11378,28 @@ mod tests {
             body.pointer("/error/code").and_then(Value::as_str),
             Some("gateway_request_schema_rejected")
         );
+    }
+
+    #[test]
+    fn unknown_protocol_schema_failure_keeps_generic_error_shape() {
+        let route = gateway_route(GatewayCliKey::OpenCode, "/unknown");
+        let provider = provider_for_cli(GatewayCliKey::OpenCode);
+        let response = local_request_schema_failure_response(
+            &route,
+            &provider,
+            "model",
+            "model",
+            GatewayForwardError::new("invalid payload", GatewayFailureKind::RequestSchema),
+            1,
+            1,
+            false,
+        );
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(body["error"], "gateway_request_schema_rejected");
+        assert_eq!(body["message"], "invalid payload");
+        assert_eq!(response.source_protocol, None);
+        assert!(response.provider_attempts.is_empty());
     }
 
     #[test]

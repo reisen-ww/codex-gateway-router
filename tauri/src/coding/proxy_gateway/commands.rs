@@ -1,5 +1,6 @@
 use super::aggregate_naming::AggregateNamingMode;
 use super::cli_proxy;
+use super::cli_proxy::manifest::AggregateGroup;
 use super::listen::check_port_available;
 use super::model_health;
 use super::paths::ProxyGatewayPaths;
@@ -367,7 +368,8 @@ pub async fn proxy_gateway_engage_failover(
 ///
 /// `provider_ids` is the user's selected sites in display order; `separator` is
 /// the string placed between the site id and the model name in the generated
-/// catalog (default `.`).
+/// catalog (default `.`). `groups` is optional for compatibility with older
+/// callers; an empty value keeps the historical aggregate behavior.
 #[tauri::command]
 pub async fn proxy_gateway_engage_aggregate(
     gateway_state: tauri::State<'_, ProxyGatewayState>,
@@ -378,6 +380,7 @@ pub async fn proxy_gateway_engage_aggregate(
     separator: Option<String>,
     aliases: Option<BTreeMap<String, String>>,
     naming: Option<AggregateNamingMode>,
+    groups: Option<Vec<AggregateGroup>>,
 ) -> Result<GatewayCliTakeoverStatus, String> {
     let _data_dir_transition = crate::app_paths::DATA_DIR_CHANGE_LOCK.lock().await;
     crate::app_paths::ensure_no_pending_data_dir_change()?;
@@ -402,6 +405,7 @@ pub async fn proxy_gateway_engage_aggregate(
         separator,
         aliases.unwrap_or_default(),
         naming.unwrap_or_default(),
+        groups.unwrap_or_default(),
     )
     .await?;
     gateway_state.clear_provider_cache()?;

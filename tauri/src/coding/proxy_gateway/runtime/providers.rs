@@ -1,7 +1,7 @@
 use crate::coding::proxy_gateway::types::{
-    normalize_pricing_model_source, CodexChatReasoningMeta, CustomHeaderOverride, GatewayCliKey,
-    GatewayProviderProfileReference, GatewayProxyMode, ModelRewriteRule, ProviderGatewayMeta,
-    ProviderPriorityEntry, ProxyGatewaySettings,
+    normalize_pricing_model_source, CodexChatReasoningMeta, CustomHeaderOverride,
+    GatewayAggregateGroup, GatewayCliKey, GatewayProviderProfileReference, GatewayProxyMode,
+    ModelRewriteRule, ProviderGatewayMeta, ProviderPriorityEntry, ProxyGatewaySettings,
 };
 use crate::coding::proxy_gateway::{
     aggregate_naming::{
@@ -90,6 +90,9 @@ pub(crate) struct GatewayProviderSelection {
     pub(crate) aggregate_aliases: std::collections::BTreeMap<String, String>,
     /// Aggregate mode only: template used by the Codex catalog and router.
     pub(crate) aggregate_naming: AggregateNamingMode,
+    /// Aggregate mode only: strict groups. An empty list preserves the legacy
+    /// aggregate routing behavior.
+    pub(crate) aggregate_groups: Vec<GatewayAggregateGroup>,
 }
 
 pub(crate) async fn load_candidate_providers(
@@ -132,10 +135,13 @@ pub(crate) async fn load_candidate_providers_with_settings_and_selection(
     ]);
     let records = db.with_conn(|conn| db_list(conn, table, Some(&order)))?;
 
+    let strict_aggregate = selection.is_some_and(|selection| {
+        selection.mode == GatewayProxyMode::Aggregate && !selection.aggregate_groups.is_empty()
+    });
     let mut providers = Vec::new();
     let mut parse_errors = Vec::new();
     for record in records {
-        match provider_from_record(cli_key, record, settings) {
+        match provider_from_record_with_catalog_mode(cli_key, record, settings, strict_aggregate) {
             Ok(Some(provider)) => providers.push(provider),
             Ok(None) => {}
             Err(error) => parse_errors.push(error),
@@ -232,6 +238,14 @@ pub(crate) fn load_gateway_provider_selection(
                 aggregate_separator: aggregate.separator,
                 aggregate_aliases: aggregate.aliases,
                 aggregate_naming: aggregate.naming,
+                aggregate_groups: aggregate
+                    .groups
+                    .into_iter()
+                    .map(|group| GatewayAggregateGroup {
+                        id: group.id,
+                        provider_ids: group.provider_ids,
+                    })
+                    .collect(),
             })
         }
     };
@@ -302,6 +316,14 @@ pub(crate) async fn load_gateway_provider_selection_async(
                 aggregate_separator: aggregate.separator,
                 aggregate_aliases: aggregate.aliases,
                 aggregate_naming: aggregate.naming,
+                aggregate_groups: aggregate
+                    .groups
+                    .into_iter()
+                    .map(|group| GatewayAggregateGroup {
+                        id: group.id,
+                        provider_ids: group.provider_ids,
+                    })
+                    .collect(),
             })
         }
     };
@@ -371,12 +393,46 @@ fn apply_provider_selection(
                 Ok(providers)
             }
         }
-        // Aggregate mode keeps every candidate so the request-time model prefix
-        // can pick the target. Selected sites are promoted to the front in the
-        // order the user arranged them; unselected sites stay available as
-        // fallbacks (they are only used when another site declares the same
-        // upstream model).
+        // Legacy aggregate mode keeps every candidate so the request-time model
+        // prefix can pick the target. Selected sites are promoted to the front
+        // in the order the user arranged them; unselected sites stay available
+        // as fallbacks.
         GatewayProxyMode::Aggregate => {
+            if !selection.aggregate_groups.is_empty() {
+                // Strict groups are the authoritative provider selection. Do
+                // not let a stale or hand-written top-level provider_ids list
+                // add, remove, or reorder the providers available to a group.
+                let manifest_groups = selection
+                    .aggregate_groups
+                    .iter()
+                    .map(|group| {
+                        crate::coding::proxy_gateway::cli_proxy::manifest::AggregateGroup {
+                            id: group.id.clone(),
+                            provider_ids: group.provider_ids.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                crate::coding::proxy_gateway::cli_proxy::manifest::validate_aggregate_groups(
+                    &manifest_groups,
+                    &providers
+                        .iter()
+                        .map(|provider| provider.id.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+
+                let mut ordered = Vec::new();
+                for group in &selection.aggregate_groups {
+                    for provider_id in &group.provider_ids {
+                        if let Some(index) = providers
+                            .iter()
+                            .position(|provider| &provider.id == provider_id)
+                        {
+                            ordered.push(providers.remove(index));
+                        }
+                    }
+                }
+                return Ok(ordered);
+            }
             let selected = &selection.aggregate_provider_ids;
             if selected.is_empty() {
                 return Ok(providers);
@@ -398,6 +454,10 @@ fn apply_provider_selection(
 pub(crate) struct AggregateRoute {
     /// Site id parsed from the model prefix, when the request carried one.
     pub(crate) site_id: Option<String>,
+    /// Strict aggregate group id parsed from the canonical `group.model`
+    /// prefix. A route has either a site id (legacy aggregate mode) or a
+    /// group id (strict aggregate mode), never both.
+    pub(crate) group_id: Option<String>,
     /// Model name to forward upstream (prefix stripped).
     pub(crate) upstream_model: String,
     /// `true` when the exact model slug selected a site and must bypass model
@@ -432,10 +492,12 @@ pub(crate) fn resolve_aggregate_route(
         aggregate_separator: separator.to_string(),
         aggregate_aliases: std::collections::BTreeMap::new(),
         aggregate_naming: AggregateNamingMode::SiteModel,
+        aggregate_groups: Vec::new(),
     };
     resolve_aggregate_route_with_selection(requested_model, &selection, providers).unwrap_or_else(
         |_| AggregateRoute {
             site_id: None,
+            group_id: None,
             upstream_model: requested_model.to_string(),
             explicit: false,
         },
@@ -447,6 +509,34 @@ pub(crate) fn resolve_aggregate_route_with_selection(
     selection: &GatewayProviderSelection,
     providers: &[UpstreamProvider],
 ) -> Result<AggregateRoute, String> {
+    if !selection.aggregate_groups.is_empty() {
+        // Strict groups deliberately use one stable model namespace regardless
+        // of the legacy aggregate naming template/separator: `<group>.model`.
+        // This prevents a request from selecting a site, a different group, or
+        // the ungrouped aggregate fallback path.
+        let parsed = split_site_model_slug(
+            requested_model,
+            ".",
+            selection
+                .aggregate_groups
+                .iter()
+                .map(|group| (group.id.as_str(), group.id.as_str())),
+        );
+        let Some((group_id, upstream_model)) = parsed else {
+            return Err(format!(
+                "Strict aggregate mode requires a model name in the form \
+                 '<group>.model'; '{}' does not name a configured group",
+                requested_model
+            ));
+        };
+        return Ok(AggregateRoute {
+            site_id: None,
+            group_id: Some(group_id),
+            upstream_model,
+            explicit: true,
+        });
+    }
+
     let selected_sites = selection
         .aggregate_provider_ids
         .iter()
@@ -471,6 +561,7 @@ pub(crate) fn resolve_aggregate_route_with_selection(
     if let Some(entry) = table.iter().find(|entry| entry.slug == requested_model) {
         return Ok(AggregateRoute {
             site_id: Some(entry.site_id.clone()),
+            group_id: None,
             upstream_model: entry.upstream_model.clone(),
             explicit: true,
         });
@@ -515,6 +606,7 @@ pub(crate) fn resolve_aggregate_route_with_selection(
     if let Some((site_id, upstream_model)) = parsed {
         return Ok(AggregateRoute {
             site_id: Some(site_id),
+            group_id: None,
             upstream_model,
             explicit: true,
         });
@@ -522,6 +614,7 @@ pub(crate) fn resolve_aggregate_route_with_selection(
 
     Ok(AggregateRoute {
         site_id: None,
+        group_id: None,
         upstream_model: requested_model.to_string(),
         explicit: false,
     })
@@ -541,7 +634,17 @@ fn provider_from_record(
     record: Value,
     settings: Option<&ProxyGatewaySettings>,
 ) -> Result<Option<UpstreamProvider>, String> {
-    let meta = provider_meta_from_record(cli_key, &record, settings);
+    provider_from_record_with_catalog_mode(cli_key, record, settings, false)
+}
+
+fn provider_from_record_with_catalog_mode(
+    cli_key: GatewayCliKey,
+    record: Value,
+    settings: Option<&ProxyGatewaySettings>,
+    strict_aggregate: bool,
+) -> Result<Option<UpstreamProvider>, String> {
+    let meta =
+        provider_meta_from_record_with_catalog_mode(cli_key, &record, settings, strict_aggregate);
     match cli_key {
         GatewayCliKey::Claude => {
             let provider = claude_code::adapter::from_db_value_provider(record);
@@ -934,10 +1037,20 @@ fn anthropic_platform_uses_bearer_auth(meta: &ProviderGatewayMeta) -> bool {
         })
 }
 
+#[cfg(test)]
 fn provider_meta_from_record(
     cli_key: GatewayCliKey,
     record: &Value,
     settings: Option<&ProxyGatewaySettings>,
+) -> ProviderGatewayMeta {
+    provider_meta_from_record_with_catalog_mode(cli_key, record, settings, false)
+}
+
+fn provider_meta_from_record_with_catalog_mode(
+    cli_key: GatewayCliKey,
+    record: &Value,
+    settings: Option<&ProxyGatewaySettings>,
+    strict_aggregate: bool,
 ) -> ProviderGatewayMeta {
     let meta_value = record.get("meta").unwrap_or(&Value::Null);
     let default_cost_multiplier = settings
@@ -1005,16 +1118,22 @@ fn provider_meta_from_record(
         meta.pricing_model_source = default_pricing_model_source;
     }
     merge_model_catalog_image_capabilities(&mut meta, record.get("settings_config"));
-    meta.declared_models = declared_models_from_settings(record.get("settings_config"));
+    meta.declared_models =
+        declared_models_from_settings(record.get("settings_config"), strict_aggregate);
     meta
 }
 
-/// Read the upstream model ids a provider declares in its `modelCatalog`.
+/// Read the upstream model ids a provider declares in its model settings.
 ///
-/// Used by aggregate mode to decide which sites may serve a given model as a
-/// fallback. Providers without a declared catalog return an empty list, which
-/// callers treat as "unknown" rather than "offers nothing".
-fn declared_models_from_settings(settings_config: Option<&Value>) -> Vec<String> {
+/// Legacy aggregate mode intentionally retains its historical precedence:
+/// `modelCatalog.models` is authoritative when present, otherwise root
+/// `models` is used. Strict groups opt into the expanded source order so the
+/// runtime matches the strict Codex catalog (`modelCatalog.models`, root
+/// `models`, then the provider default model from config.toml).
+fn declared_models_from_settings(
+    settings_config: Option<&Value>,
+    strict_aggregate: bool,
+) -> Vec<String> {
     let Some(settings_config) = settings_config else {
         return Vec::new();
     };
@@ -1023,28 +1142,69 @@ fn declared_models_from_settings(settings_config: Option<&Value>) -> Vec<String>
         Value::Object(_) => Some(settings_config.clone()),
         _ => None,
     };
-    let Some(models) = settings_value
-        .as_ref()
-        .and_then(|value| value.get("modelCatalog").or(Some(value)))
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-        .or_else(|| {
-            settings_value
-                .as_ref()
-                .and_then(|value| value.get("models"))
-                .and_then(Value::as_array)
-        })
-    else {
+    let Some(value) = settings_value.as_ref() else {
         return Vec::new();
     };
-
     let mut out = Vec::new();
-    for model in models {
-        if let Some(model_id) = model_catalog_model_id(model) {
-            push_unique_string(&mut out, model_id);
+    let catalog_models = value
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array);
+    let root_models = value.get("models").and_then(Value::as_array);
+
+    if let Some(models) = catalog_models {
+        for model in models {
+            if let Some(model_id) = declared_model_id_from_settings_item(model, strict_aggregate) {
+                push_unique_string(&mut out, model_id);
+            }
+        }
+    } else if let Some(models) = root_models {
+        // This preserves the old fallback when modelCatalog is absent or
+        // malformed, while an explicitly empty catalog remains authoritative.
+        for model in models {
+            if let Some(model_id) = declared_model_id_from_settings_item(model, strict_aggregate) {
+                push_unique_string(&mut out, model_id);
+            }
+        }
+    }
+
+    if strict_aggregate {
+        if catalog_models.is_some() {
+            if let Some(models) = root_models {
+                for model in models {
+                    if let Some(model_id) =
+                        declared_model_id_from_settings_item(model, strict_aggregate)
+                    {
+                        push_unique_string(&mut out, model_id);
+                    }
+                }
+            }
+        }
+        if let Some(config_toml) = value.get("config").and_then(Value::as_str) {
+            if let Some(model_id) = codex_model_from_config(config_toml) {
+                push_unique_string(&mut out, model_id);
+            }
         }
     }
     out
+}
+
+/// Strict aggregate catalogs accept string model shorthands in addition to the
+/// object rows supported by the legacy provider metadata path. Keep the
+/// legacy path unchanged while making runtime model membership match the
+/// strict Codex catalog exactly.
+fn declared_model_id_from_settings_item(model: &Value, strict_aggregate: bool) -> Option<String> {
+    if strict_aggregate {
+        if let Some(model_id) = model
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        {
+            return Some(model_id);
+        }
+    }
+    model_catalog_model_id(model)
 }
 
 fn gateway_profile_reference_from_meta(value: &Value) -> Option<GatewayProviderProfileReference> {
@@ -1943,6 +2103,7 @@ mod tests {
                     .to_string(),
             aggregate_aliases: std::collections::BTreeMap::new(),
             aggregate_naming: AggregateNamingMode::default(),
+            aggregate_groups: Vec::new(),
         }
     }
 
@@ -1971,6 +2132,7 @@ mod tests {
             aggregate_separator: separator.to_string(),
             aggregate_aliases: std::collections::BTreeMap::new(),
             aggregate_naming: AggregateNamingMode::default(),
+            aggregate_groups: Vec::new(),
         }
     }
 
@@ -2011,6 +2173,52 @@ mod tests {
 
         let ids: Vec<&str> = selected.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["site-a"]);
+    }
+
+    #[test]
+    fn strict_aggregate_selection_uses_group_union_not_legacy_provider_ids() {
+        let providers = vec![
+            provider("group-a", Some(10)),
+            provider("group-b", Some(20)),
+            provider("ungrouped", Some(30)),
+        ];
+        let selection = GatewayProviderSelection {
+            mode: GatewayProxyMode::Aggregate,
+            primary_provider_id: "ungrouped".to_string(),
+            // This stale legacy list must not control strict routing.
+            aggregate_provider_ids: vec!["ungrouped".to_string()],
+            aggregate_separator: ">".to_string(),
+            aggregate_aliases: std::collections::BTreeMap::new(),
+            aggregate_naming: AggregateNamingMode::ModelOnly,
+            aggregate_groups: vec![GatewayAggregateGroup {
+                id: "fast".to_string(),
+                provider_ids: vec!["group-b".to_string(), "group-a".to_string()],
+            }],
+        };
+
+        let selected = apply_provider_selection(providers, Some(&selection)).unwrap();
+        let ids: Vec<&str> = selected.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["group-b", "group-a"]);
+    }
+
+    #[test]
+    fn strict_aggregate_selection_rejects_stale_group_provider() {
+        let selection = GatewayProviderSelection {
+            mode: GatewayProxyMode::Aggregate,
+            primary_provider_id: "group-a".to_string(),
+            aggregate_provider_ids: vec!["group-a".to_string()],
+            aggregate_separator: ".".to_string(),
+            aggregate_aliases: std::collections::BTreeMap::new(),
+            aggregate_naming: AggregateNamingMode::default(),
+            aggregate_groups: vec![GatewayAggregateGroup {
+                id: "fast".to_string(),
+                provider_ids: vec!["missing".to_string()],
+            }],
+        };
+
+        let error = apply_provider_selection(vec![provider("group-a", Some(10))], Some(&selection))
+            .expect_err("stale strict groups must fail closed");
+        assert!(error.contains("not available for Gateway proxy"));
     }
 
     #[test]
@@ -2059,6 +2267,124 @@ mod tests {
 
         assert_eq!(route.site_id, None);
         assert_eq!(route.upstream_model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn strict_aggregate_route_requires_group_slug_and_rejects_legacy_fallbacks() {
+        let providers = vec![provider("provider-a", None), provider("provider-b", None)];
+        let selection = GatewayProviderSelection {
+            mode: GatewayProxyMode::Aggregate,
+            primary_provider_id: "provider-a".to_string(),
+            aggregate_provider_ids: vec!["provider-a".to_string(), "provider-b".to_string()],
+            aggregate_separator: ">".to_string(),
+            aggregate_aliases: std::collections::BTreeMap::new(),
+            aggregate_naming: AggregateNamingMode::ModelOnly,
+            aggregate_groups: vec![
+                GatewayAggregateGroup {
+                    id: "fast".to_string(),
+                    provider_ids: vec!["provider-a".to_string()],
+                },
+                GatewayAggregateGroup {
+                    id: "slow".to_string(),
+                    provider_ids: vec!["provider-b".to_string()],
+                },
+            ],
+        };
+
+        let route = resolve_aggregate_route_with_selection("fast.gpt-5", &selection, &providers)
+            .expect("canonical strict group slug");
+        assert_eq!(route.site_id, None);
+        assert_eq!(route.group_id.as_deref(), Some("fast"));
+        assert_eq!(route.upstream_model, "gpt-5");
+        assert!(route.explicit);
+
+        for invalid_slug in [
+            "gpt-5",            // bare model: no group selection
+            "provider-a.gpt-5", // legacy site prefix
+            "gpt-5>provider-a", // legacy model-at-site separator/template
+            "missing.gpt-5",    // unknown group
+        ] {
+            assert!(
+                resolve_aggregate_route_with_selection(invalid_slug, &selection, &providers)
+                    .is_err(),
+                "strict groups must reject non-canonical slug {invalid_slug:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_models_include_catalog_root_and_default_model_sources() {
+        let settings = serde_json::json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "catalog-model" },
+                    { "id": "shared-model" }
+                ]
+            },
+            "models": [
+                { "name": "root-model" },
+                { "model": "shared-model" }
+            ],
+            "config": "model = \"default-model\"\n"
+        });
+
+        assert_eq!(
+            declared_models_from_settings(Some(&settings), true),
+            vec![
+                "catalog-model".to_string(),
+                "shared-model".to_string(),
+                "root-model".to_string(),
+                "default-model".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_declared_models_accept_string_rows_and_chat_model_precedence() {
+        let settings = serde_json::json!({
+            "modelCatalog": {
+                "models": ["catalog-shorthand", { "model": "catalog-object" }]
+            },
+            "models": ["root-shorthand"],
+            "config": "model = \"root-default\"\n[chat]\nmodel = \"chat-default\"\n"
+        });
+
+        assert_eq!(
+            declared_models_from_settings(Some(&settings), true),
+            vec![
+                "catalog-shorthand".to_string(),
+                "catalog-object".to_string(),
+                "root-shorthand".to_string(),
+                "chat-default".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_declared_models_ignore_string_rows() {
+        let settings = serde_json::json!({
+            "modelCatalog": { "models": ["catalog-shorthand", { "model": "catalog-object" }] },
+            "models": ["root-shorthand"]
+        });
+
+        assert_eq!(
+            declared_models_from_settings(Some(&settings), false),
+            vec!["catalog-object".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_declared_models_keep_catalog_precedence() {
+        let settings = serde_json::json!({
+            "modelCatalog": { "models": [{ "model": "catalog-model" }] },
+            "models": [{ "model": "root-model" }],
+            "config": "model = \"default-model\"\n"
+        });
+
+        assert_eq!(
+            declared_models_from_settings(Some(&settings), false),
+            vec!["catalog-model".to_string()]
+        );
     }
 
     #[test]

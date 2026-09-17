@@ -40,14 +40,19 @@ export {
 } from './gatewayAggregateCandidates';
 export {
   buildGatewayAggregateModelSlug,
+  buildGatewayAggregateGroupModelSlug,
+  flattenGatewayAggregateGroups,
   prepareGatewayAggregateAliasReengage,
+  normalizeGatewayAggregateGroups,
   normalizeGatewayAggregateAliases,
+  pruneStaleGatewayAggregateAliases,
   isAggregateSiteId,
   normalizeGatewayAggregateSiteIds,
   resolveGatewayReengageMode,
   toGatewayAggregateReengageConfig,
   validateGatewayAggregateSeparator,
   validateGatewayAggregateAlias,
+  validateGatewayAggregateGroupId,
   type GatewayAggregateSeparatorInvalidReason,
 } from './gatewayAggregateConfig';
 export {

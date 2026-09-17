@@ -618,13 +618,13 @@ const GrokPage: React.FC = () => {
       restoreDirect: () => restoreProxyGatewayCliDirect('grok'),
       engageSingle: () => engageProxyGatewaySingle('grok', provider.id),
       engageFailover: () => engageProxyGatewayFailover('grok'),
-      engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-        engageProxyGatewayAggregate('grok', providerIds, separator, aliases, naming),
+      engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+        engageProxyGatewayAggregate('grok', providerIds, separator, aliases, naming, groups),
       onGatewayStatusChange: setGatewayCliStatus,
     });
     await loadConfig(true);
     await refreshTrayMenu();
-  }, [gatewayCliStatus?.mode, loadConfig]);
+  }, [gatewayCliStatus, loadConfig]);
 
   const clearBatchDeleteState = React.useCallback((providerId?: string) => {
     if (providerId) {
@@ -1559,8 +1559,8 @@ const GrokPage: React.FC = () => {
         restoreDirect: () => restoreProxyGatewayCliDirect('grok'),
         engageSingle: () => engageProxyGatewaySingle('grok', savedProviderId),
         engageFailover: () => engageProxyGatewayFailover('grok'),
-        engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-          engageProxyGatewayAggregate('grok', providerIds, separator, aliases, naming),
+        engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+          engageProxyGatewayAggregate('grok', providerIds, separator, aliases, naming, groups),
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           if (isLocalTemp) {

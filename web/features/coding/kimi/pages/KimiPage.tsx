@@ -325,8 +325,8 @@ const KimiPage: React.FC = () => {
       restoreDirect: () => restoreProxyGatewayCliDirect('kimi'),
       engageSingle: () => engageProxyGatewaySingle('kimi', savedProviderId),
       engageFailover: () => engageProxyGatewayFailover('kimi'),
-      engageAggregate: ({ providerIds, separator, aliases, naming }) =>
-        engageProxyGatewayAggregate('kimi', providerIds, separator, aliases, naming),
+      engageAggregate: ({ providerIds, separator, aliases, naming, groups }) =>
+        engageProxyGatewayAggregate('kimi', providerIds, separator, aliases, naming, groups),
       onGatewayStatusChange: setGatewayCliStatus,
       saveProvider: async () => {
         switch (plan.action) {
