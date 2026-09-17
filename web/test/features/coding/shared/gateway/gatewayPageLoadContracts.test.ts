@@ -52,13 +52,31 @@ test('CLI config loaders reject stale responses and refresh takeover status', as
       /if \(requestId !== loadConfigRequestIdRef\.current\) return;/,
       `${contract.name}: stale response guard missing`,
     );
-    assert.match(
-      loadBlock,
-      new RegExp(
-        String.raw`getProxyGatewayCliStatus\('${contract.cliKey}'\)[\s\S]*?if \(requestId !== loadConfigRequestIdRef\.current\) return;`,
-      ),
-      `${contract.name}: Gateway status refresh is not request-scoped`,
-    );
+    if (contract.cliKey === 'codex') {
+      // Codex has an additional aggregate quick-entry refresh path, so its
+      // Gateway status uses a dedicated request generation shared by config
+      // loads and aggregate mutations. This is stricter than tying status to a
+      // single loadConfig invocation: an old config load cannot overwrite a
+      // newer aggregate result.
+      assert.match(
+        loadBlock,
+        /void refreshGatewayCliStatus\(\)\.catch\(\(\) => \{\}\);/,
+        `${contract.name}: Gateway status refresh is not delegated`,
+      );
+      assert.match(
+        source,
+        /const refreshGatewayCliStatus = React\.useCallback\(async \(\) => \{[\s\S]*?gatewayCliStatusRequestRef\.current = request;[\s\S]*?getProxyGatewayCliStatus\('codex'\)[\s\S]*?gatewayCliStatusRequestRef\.current === request/,
+        `${contract.name}: Gateway status refresh is not request-scoped`,
+      );
+    } else {
+      assert.match(
+        loadBlock,
+        new RegExp(
+          String.raw`getProxyGatewayCliStatus\('${contract.cliKey}'\)[\s\S]*?if \(requestId !== loadConfigRequestIdRef\.current\) return;`,
+        ),
+        `${contract.name}: Gateway status refresh is not request-scoped`,
+      );
+    }
     assert.match(
       loadBlock,
       /catch \(error\) \{[\s\S]*?if \(requestId !== loadConfigRequestIdRef\.current\) return;/,

@@ -58,6 +58,8 @@ sequenceDiagram
 - 自定义 provider 的「自动审批模型」是 provider 级单值（`settingsConfig.autoReviewModelOverride`），UI 放在模型映射面板内、「添加模型映射」按钮下方，不是映射表格的每一行。只在自定义模式且展开模型映射时可见；留空表示不覆盖。可提供“设为自身”把当前默认 `model` 填入该字段（不改主模型）。后端 apply 时默认投影到 catalog 全部 entry；若默认 model 不在映射中会自动补入，确保 Codex 能读到 override。不提供应用范围选项。
 - Codex 内置 Anthropic/Claude 协议 endpoint 如果没有显式 `modelCatalog`，添加供应商时应从同一渠道的 Claude endpoint 角色模型派生初始模型映射；如果 endpoint 自带 `modelCatalog`，仍以 endpoint 自身目录为准。派生逻辑只用于补齐添加表单的初始值，不能改变 Base URL 可编辑和保存用户当前输入值的语义。
 - Gateway 现在是 direct → single → failover 三态。single 入口在已应用 provider 卡片的“网关代理”按钮；single/failover 接管期间都必须锁定其他 provider 的“应用”入口，failover 时卡片额外显示 P0/P1 优先级，切 P0 必须先恢复直连。
+- Codex 处于任一 Gateway 接管模式（single/failover/aggregate）时，可在故障转移按钮旁显示独立的「聚合模式」配置入口；它打开复用 `GatewayAggregateSettings` 的右侧配置面板，先读取真实 Gateway running 状态，再由该组件执行 engage/restore。Gateway 设置页与该快捷面板会同时存在于 KeepAlive 生命周期中，因此聚合写操作必须走共享 mutation lane，并在成功后广播、重读后端 manifest；不要在 Codex 页另写一套草稿、请求或路由规则。
+- 聚合快捷入口的 Drawer 会 portal 到页面外：Codex KeepAlive 页面失活时必须关闭并作废未完成的状态读取，不能残留在其它工作台之上；Drawer 打开期间订阅 `gateway-running-changed` 重读真实运行态。Codex 自己刷新 CLI 接管状态也要走单调 request id，避免旧响应把刚保存的聚合状态覆盖掉。
 - 前端不要假设 Codex prompt 文件名永远是 `AGENTS.md`。展示路径、删除已应用 prompt 后的刷新和同步结果都以后端返回/事件为准。
 - 插件页的全部启用/全部禁用只作用于“已安装”Tab 中当前 runtime 的已安装插件，不作用于市场可安装列表；全部启用需要允许后端同时开启 plugins feature，成功后仍按现有规则提示用户重启 Codex。
 - 市场添加入口与 Grok/Claude 对齐：marketplaces Tab 工具栏与空态各有“添加”按钮，打开带文本输入框的 Modal。输入框接受 git 仓库 URL / GitHub `owner/repo` 简写 / `marketplace.json` 直链 / 本地目录；“选择目录”按钮把本地目录回填到输入框（不直接提交）。提交统一走 `addCodexPluginWorkspaceRoot({ path })`，由后端识别源类型并下载/克隆；失败时 Modal 保持打开（`marketplace-add-failed`）。不要为本地目录再加单独的直选入口，避免重复。

@@ -28,11 +28,13 @@ pub struct AggregateManifestConfig {
     /// Sites selected for aggregate routing, in the user's display order.
     #[serde(default)]
     pub provider_ids: Vec<String>,
-    /// Separator between site id and upstream model name. Defaults to `.`.
+    /// Separator between the effective site prefix and upstream model name.
+    /// Defaults to `.`.
     #[serde(default = "default_aggregate_separator")]
     pub separator: String,
-    /// Per-site display/routing aliases. A missing entry falls back to the
-    /// provider id so manifests written before aliases remain compatible.
+    /// Per-site display/routing prefixes. New legacy aggregate manifests persist
+    /// a safe provider display name here when no explicit alias was supplied;
+    /// old manifests with no entry still fall back to the provider id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     /// How `(site, model)` pairs are named in the generated Codex catalog.
@@ -68,17 +70,20 @@ pub const AGGREGATE_DEFAULT_SEPARATOR: &str = ".";
 /// Validate a user-supplied aggregate separator.
 ///
 /// The separator must be non-empty and must not contain characters that are
-/// legal inside a site id, otherwise `<site_id><sep><model>` becomes ambiguous
-/// and cannot be split back reliably.
+/// legal inside a site prefix, otherwise `<site><sep><model>` becomes
+/// ambiguous and cannot be split back reliably.
 pub fn validate_aggregate_separator(separator: &str) -> Result<(), String> {
     if separator.is_empty() {
         return Err("Aggregate separator must not be empty".to_string());
     }
     if separator
         .chars()
-        .any(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        .any(|ch| ch.is_alphanumeric() || ch.is_whitespace() || ch == '_' || ch == '-')
     {
-        return Err("Aggregate separator must not contain letters, digits, '_' or '-'".to_string());
+        return Err(
+            "Aggregate separator must not contain letters, digits, whitespace, '_' or '-'"
+                .to_string(),
+        );
     }
     Ok(())
 }

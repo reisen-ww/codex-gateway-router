@@ -3041,6 +3041,7 @@ fn codex_aggregate_catalog_entries(
         let Some(models) = settings_config
             .get("modelCatalog")
             .and_then(|catalog| catalog.get("models"))
+            .or_else(|| settings_config.get("models"))
             .and_then(|models| models.as_array())
         else {
             continue;
@@ -3049,68 +3050,34 @@ fn codex_aggregate_catalog_entries(
         // Mirror the single-provider catalog's naming helpers so a mapped model
         // keeps its display name and context window in aggregate mode too.
         for item in models {
+            // Keep the generated legacy catalog in lockstep with
+            // `declared_models_from_settings(..., false)` in the runtime:
+            // `modelCatalog.models` is authoritative when present, root
+            // `models` is the fallback, and legacy rows accept the established
+            // object field aliases but not string shorthand.
             let Some(model) = item
-                .get("model")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
+                .as_object()
+                .and_then(|_| codex_model_id_from_aggregate_item(item))
             else {
                 continue;
             };
-            let Some(slug) = naming.allocate(&mut allocator, site_id, model)? else {
+            let Some(slug) = naming.allocate(&mut allocator, site_id, &model)? else {
                 continue;
             };
 
-            let model_display_name = item
-                .get("displayName")
-                .or_else(|| item.get("display_name"))
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(model);
+            let spec = codex_aggregate_model_spec_from_item(item, model);
+            let display_name = format!(
+                "{site_label} · {}",
+                spec.display_name.as_deref().unwrap_or(&spec.model)
+            );
 
             entries.push(AggregateCatalogEntry {
                 slug,
-                display_name: format!("{site_label} · {model_display_name}"),
-                context_window: parse_codex_positive_u64(
-                    item.get("contextWindow")
-                        .or_else(|| item.get("context_window")),
-                ),
-                reasoning_levels: item
-                    .get("reasoningLevels")
-                    .or_else(|| item.get("reasoning_levels"))
-                    .and_then(|value| value.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str())
-                            .map(str::trim)
-                            .filter(|level| !level.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|levels| !levels.is_empty()),
-                default_reasoning_level: item
-                    .get("defaultReasoningLevel")
-                    .or_else(|| item.get("default_reasoning_level"))
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|level| !level.is_empty())
-                    .map(str::to_string),
-                service_tiers: item
-                    .get("serviceTiers")
-                    .or_else(|| item.get("service_tiers"))
-                    .and_then(|value| value.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str())
-                            .map(str::trim)
-                            .filter(|tier| !tier.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|tiers| !tiers.is_empty()),
+                display_name,
+                context_window: spec.context_window,
+                reasoning_levels: spec.reasoning_levels,
+                default_reasoning_level: spec.default_reasoning_level,
+                service_tiers: spec.service_tiers,
                 auto_review_model_override: None,
             });
         }
@@ -5361,6 +5328,56 @@ approval_policy = "never"
         let entries = codex_aggregate_catalog_entries(&sites, &aggregate_naming("/")).unwrap();
 
         assert_eq!(entries[0].slug, "site1/m1");
+    }
+
+    #[test]
+    fn legacy_aggregate_catalog_matches_runtime_model_sources_and_id_aliases() {
+        let sites = vec![
+            (
+                "root-site".to_string(),
+                "Root Site".to_string(),
+                json!({
+                    "models": [{ "id": "root-id", "display_name": "Root ID" }]
+                }),
+            ),
+            (
+                "catalog-site".to_string(),
+                "Catalog Site".to_string(),
+                json!({
+                    "modelCatalog": {
+                        "models": [
+                            { "name": "catalog-name" },
+                            { "modelId": "catalog-camel" },
+                            { "model_id": "catalog-snake" },
+                            "legacy-string-is-not-runtime-routeable"
+                        ]
+                    },
+                    "models": [{ "model": "root-must-not-append" }]
+                }),
+            ),
+            (
+                "empty-catalog".to_string(),
+                "Empty Catalog".to_string(),
+                json!({
+                    "modelCatalog": { "models": [] },
+                    "models": [{ "model": "root-must-not-fallback" }]
+                }),
+            ),
+        ];
+
+        let entries = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let slugs: Vec<&str> = entries.iter().map(|entry| entry.slug.as_str()).collect();
+
+        assert_eq!(
+            slugs,
+            vec![
+                "root-site.root-id",
+                "catalog-site.catalog-name",
+                "catalog-site.catalog-camel",
+                "catalog-site.catalog-snake",
+            ]
+        );
+        assert_eq!(entries[0].display_name, "Root Site · Root ID");
     }
 
     #[test]

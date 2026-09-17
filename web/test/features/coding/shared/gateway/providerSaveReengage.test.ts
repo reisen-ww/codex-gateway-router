@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { saveProviderWithGatewayReengage } from '../../../../../features/coding/shared/gateway/providerSaveReengage.ts';
+import {
+  getGatewayAggregateConfigVersion,
+  runGatewayAggregateMutation,
+} from '../../../../../features/coding/shared/gateway/gatewayAggregateMutation.ts';
 
 test('save provider reengage helper saves directly when gateway mode is inactive', async () => {
   const calls: string[] = [];
@@ -248,7 +252,7 @@ test('save provider reengage helper refuses aggregate without a selection', asyn
     /Aggregate gateway re-engage requires/,
   );
 
-  assert.deepEqual(calls, ['restore', 'status:direct', 'save']);
+  assert.deepEqual(calls, []);
 });
 
 test('save provider reengage helper still reengages aggregate when the save fails', async () => {
@@ -286,4 +290,73 @@ test('save provider reengage helper still reengages aggregate when the save fail
   );
 
   assert.deepEqual(calls, ['restore', 'status:direct', 'save']);
+});
+
+test('aggregate provider save waits for prior aggregate edits and re-reads the canonical config', async () => {
+  const calls: string[] = [];
+  let releasePriorMutation!: () => void;
+  const priorMutationGate = new Promise<void>((resolve) => {
+    releasePriorMutation = resolve;
+  });
+  let markPriorMutationStarted!: () => void;
+  const priorMutationStarted = new Promise<void>((resolve) => {
+    markPriorMutationStarted = resolve;
+  });
+  const beforeVersion = getGatewayAggregateConfigVersion();
+
+  const priorMutation = runGatewayAggregateMutation(async () => {
+    calls.push('drawer:start');
+    markPriorMutationStarted();
+    await priorMutationGate;
+    calls.push('drawer:end');
+  });
+  await priorMutationStarted;
+
+  const providerSave = saveProviderWithGatewayReengage({
+    gatewayMode: 'aggregate',
+    // This was captured before the drawer edit and must not be replayed.
+    aggregateConfig: { providerIds: ['old-site'], separator: '.' },
+    resolveCurrentGatewayReengage: async () => {
+      calls.push('read-current');
+      return {
+        gatewayMode: 'aggregate',
+        aggregateConfig: { providerIds: ['new-site'], separator: '::' },
+      };
+    },
+    restoreDirect: async () => {
+      calls.push('restore');
+      return 'direct';
+    },
+    saveProvider: async () => {
+      calls.push('save');
+      return 'saved';
+    },
+    engageSingle: async () => {
+      calls.push('single');
+      return 'single';
+    },
+    engageFailover: async () => {
+      calls.push('failover');
+      return 'failover';
+    },
+    engageAggregate: async (config) => {
+      calls.push(`aggregate:${config.providerIds.join(',')}:${config.separator}`);
+      return 'aggregate';
+    },
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(calls, ['drawer:start']);
+  releasePriorMutation();
+  await priorMutation;
+  assert.equal(await providerSave, 'saved');
+  assert.deepEqual(calls, [
+    'drawer:start',
+    'drawer:end',
+    'read-current',
+    'restore',
+    'save',
+    'aggregate:new-site:::',
+  ]);
+  assert.equal(getGatewayAggregateConfigVersion(), beforeVersion + 1);
 });

@@ -30,14 +30,20 @@ import {
   type GatewayAggregateNamingMode,
   type GatewayCliTakeoverStatus,
 } from '@/services';
+import { refreshTrayMenu } from '@/services/appApi';
 import { listCodexProviders } from '@/services/codexApi';
 import {
   buildGatewayAggregateGroupModelSlug,
   createLatestGatewayAggregateOperationQueue,
+  defaultGatewayAggregateAlias,
   flattenGatewayAggregateGroups,
+  getGatewayAggregateConfigVersion,
   normalizeGatewayAggregateSeparator,
   normalizeGatewayAggregateGroups,
+  notifyGatewayAggregateConfigChanged,
   pruneStaleGatewayAggregateAliases,
+  runGatewayAggregateMutation,
+  subscribeGatewayAggregateConfig,
   validateGatewayAggregateGroupId,
 } from '@/features/coding/shared/gateway/gatewayAggregateConfig';
 import {
@@ -223,6 +229,11 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   const [notice, setNotice] = React.useState<{ kind: 'error' | 'success'; text: string } | null>(
     null,
   );
+  const aggregateConfigVersion = React.useSyncExternalStore(
+    subscribeGatewayAggregateConfig,
+    getGatewayAggregateConfigVersion,
+    getGatewayAggregateConfigVersion,
+  );
   const revisionRef = React.useRef(0);
   const statusRequestRef = React.useRef(0);
   const mountedRef = React.useRef(true);
@@ -322,6 +333,17 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     };
   }, [applyCliStatuses]);
 
+  // A second editor (for example the Codex quick-entry drawer) may have
+  // changed the aggregate manifest while this KeepAlive panel was hidden.
+  // Re-read the canonical status rather than letting this instance retain a
+  // stale draft that could overwrite the newer configuration.
+  React.useEffect(() => {
+    if (aggregateConfigVersion === 0) {
+      return;
+    }
+    void refreshCliStatuses().catch(() => undefined);
+  }, [aggregateConfigVersion, refreshCliStatuses]);
+
   React.useEffect(() => {
     let disposed = false;
     const request = revisionRef.current + 1;
@@ -407,15 +429,20 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       await operationQueueRef.current.enqueue(async (isCurrent) => {
         const isMountedAndCurrent = () => mountedRef.current && isCurrent();
         try {
-          await execute();
-          if (!isMountedAndCurrent()) {
-            return;
-          }
-          await refreshCliStatuses();
-          if (!isMountedAndCurrent()) {
-            return;
-          }
+          await runGatewayAggregateMutation(execute);
+          notifyGatewayAggregateConfigChanged();
+          void refreshTrayMenu().catch(() => undefined);
+          // The parent owns additional Gateway UI (including Codex provider
+          // locks). Notify it even if this editor was closed while the backend
+          // write was in flight; the mutation has already succeeded.
           onTakeoverChange?.();
+          if (!isMountedAndCurrent()) {
+            return;
+          }
+          await refreshCliStatuses().catch(() => undefined);
+          if (!isMountedAndCurrent()) {
+            return;
+          }
           setNotice({ kind: 'success', text: successText });
         } catch (error) {
           if (isMountedAndCurrent()) {
@@ -527,12 +554,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     const nextSiteIds = checked
       ? normalizeGatewayAggregateSiteIds([...siteIds, siteId])
       : siteIds.filter((item) => item !== siteId);
-    setSiteIds(nextSiteIds);
-    if (!checked && siteId in aliases) {
-      const nextAliases = { ...aliases };
+    const nextAliases = { ...aliases };
+    if (!checked) {
       delete nextAliases[siteId];
-      setAliases(nextAliases);
     }
+    setSiteIds(nextSiteIds);
+    setAliases(nextAliases);
     // Auto-save: a running aggregate takeover must follow the new site list.
     if (!engaged) {
       return;
@@ -543,13 +570,13 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       await handleToggle(false);
       return;
     }
-    const nextAliases = normalizeGatewayAggregateAliases(
-      aliases,
+    const normalizedNextAliases = normalizeGatewayAggregateAliases(
+      nextAliases,
       nextSiteIds,
       addressableSiteIds,
     );
-    if (separatorError === null && nextAliases) {
-      void runEngage(nextSiteIds, effectiveSeparator, nextAliases, naming, []);
+    if (separatorError === null && normalizedNextAliases) {
+      void runEngage(nextSiteIds, effectiveSeparator, normalizedNextAliases, naming, []);
     }
   };
 
@@ -817,10 +844,16 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     .map((siteId) => candidates.find((candidate) => candidate.id === siteId))
     .filter((candidate): candidate is GatewayAggregateSiteCandidate => Boolean(candidate));
   const unselectedCandidates = candidates.filter((candidate) => !siteIds.includes(candidate.id));
+  const exampleCandidate = selectedCandidates[0] ?? candidates[0];
+  const examplePrefix = exampleCandidate
+    ? aliases[exampleCandidate.id]
+      || defaultGatewayAggregateAlias(exampleCandidate.name)
+      || exampleCandidate.id
+    : 'site-name';
   const separatorExample = strictGroups
     ? buildGatewayAggregateGroupModelSlug(groups[0]?.id || 'group', 'model')
     : buildGatewayAggregateModelSlug(
-        aliases[candidates[0]?.id ?? ''] || candidates[0]?.id || 'site-id',
+        examplePrefix,
         'model',
         separatorError === null ? effectiveSeparator : DEFAULT_AGGREGATE_SEPARATOR,
         naming,

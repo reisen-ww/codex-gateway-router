@@ -143,12 +143,13 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
   const actionLabel = failoverActive
     ? t('gateway.failover.disengageButton')
     : aggregateActive
-      ? t('gateway.aggregate.button')
+      ? t('gateway.takeover.statusButton')
       : t('gateway.failover.button');
   // Aggregate sites are addressed by model prefix; the label the model list
   // shows for each (site, model) pair is the concrete thing to display.
   const aggregateSeparator = status?.aggregate?.separator ?? DEFAULT_AGGREGATE_SEPARATOR;
   const aggregateSiteIds = status?.aggregate?.provider_ids ?? [];
+  const aggregateAliases = status?.aggregate?.aliases ?? {};
   const aggregateGroups = status?.aggregate?.groups ?? [];
   const strictAggregateActive = aggregateActive && aggregateGroups.length > 0;
 
@@ -359,7 +360,11 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
                         ))
                       : aggregateSiteIds.map((siteId) => (
                           <code key={siteId}>
-                            {buildGatewayAggregateModelSlug(siteId, '<model>', aggregateSeparator)}
+                            {buildGatewayAggregateModelSlug(
+                              aggregateAliases[siteId]?.trim() || siteId,
+                              '<model>',
+                              aggregateSeparator,
+                            )}
                           </code>
                         ))}
                   </div>

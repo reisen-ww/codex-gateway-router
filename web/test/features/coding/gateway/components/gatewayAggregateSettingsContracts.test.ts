@@ -19,3 +19,17 @@ test('strict aggregate group drafts keep React identity separate from API payloa
   assert.match(requestProjection, /provider_ids: \[\.\.\.group\.provider_ids\]/);
   assert.doesNotMatch(requestProjection, /draftKey/);
 });
+
+test('legacy aggregate preview uses the configured alias or the provider display name before its opaque id', async () => {
+  const source = await readFile(
+    new URL('../../../../../features/coding/gateway/components/GatewayAggregateSettings.tsx', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(source, /const exampleCandidate = selectedCandidates\[0\] \?\? candidates\[0\];/);
+  assert.match(source, /defaultGatewayAggregateAlias\(exampleCandidate\.name\)/);
+  assert.match(
+    source,
+    /aliases\[exampleCandidate\.id\]\s*\|\|\s*defaultGatewayAggregateAlias\(exampleCandidate\.name\)\s*\|\|\s*exampleCandidate\.id/,
+  );
+});

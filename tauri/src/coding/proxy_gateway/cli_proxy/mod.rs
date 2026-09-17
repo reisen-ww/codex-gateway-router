@@ -646,6 +646,7 @@ pub async fn engage_aggregate_cli(
     // Legacy separator validation is intentionally skipped there so stale
     // legacy settings cannot block or alter a group-driven takeover.
     let separator = if groups.is_empty() {
+        let separator = separator.trim().to_string();
         crate::coding::proxy_gateway::cli_proxy::manifest::validate_aggregate_separator(
             &separator,
         )?;
@@ -708,29 +709,20 @@ pub async fn engage_aggregate_cli(
         return Err("Select at least one site for aggregate mode".to_string());
     }
     let aliases = if groups.is_empty() {
-        let aliases = aliases
-            .into_iter()
-            .map(|(provider_id, alias)| (provider_id, alias.trim().to_string()))
-            .filter(|(_, alias)| !alias.is_empty())
-            .collect::<BTreeMap<_, _>>();
-        if let Some(unknown_provider_id) = aliases
-            .keys()
-            .find(|provider_id| !ordered_ids.iter().any(|id| id == *provider_id))
-        {
-            return Err(format!(
-                "Aggregate alias references unselected site '{unknown_provider_id}'"
-            ));
-        }
-        crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_aliases(&aliases)?;
-        // Runtime aggregate routing also keeps every enabled, unselected provider
-        // addressable by its provider id as a fallback. Validate aliases against
-        // that complete addressable set, not only the selected sites, so an alias
-        // cannot shadow an unselected provider id.
-        crate::coding::proxy_gateway::aggregate_naming::validate_aggregate_site_prefixes(
+        // Prefer the user-configured provider name for new legacy aggregate
+        // prefixes. The resolver persists the resulting mapping in the manifest,
+        // so catalog generation and runtime routing keep using the same stable
+        // name even after the page closes. Explicit aliases still take priority,
+        // while duplicate/unsafe display names fall back to provider ids.
+        let selected_sites = ordered_providers
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.name.clone()))
+            .collect::<Vec<_>>();
+        crate::coding::proxy_gateway::aggregate_naming::resolve_aggregate_site_aliases(
+            aliases,
+            &selected_sites,
             &available_ids,
-            &aliases,
-        )?;
-        aliases
+        )?
     } else {
         // Group ids, not site aliases, are the strict model namespace. Ignore
         // legacy aliases entirely instead of letting stale invalid entries

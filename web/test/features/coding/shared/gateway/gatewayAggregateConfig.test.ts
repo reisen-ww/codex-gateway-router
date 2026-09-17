@@ -5,8 +5,11 @@ import type { GatewayCliTakeoverStatus } from '../../../../../services/proxyGate
 import {
   buildGatewayAggregateModelSlug,
   createLatestGatewayAggregateOperationQueue,
+  defaultGatewayAggregateAlias,
   flattenGatewayAggregateGroups,
+  getGatewayAggregateConfigVersion,
   isAggregateSiteId,
+  notifyGatewayAggregateConfigChanged,
   normalizeGatewayAggregateAliases,
   normalizeGatewayAggregateGroups,
   normalizeGatewayAggregateSeparator,
@@ -14,7 +17,10 @@ import {
   prepareGatewayAggregateAliasReengage,
   pruneStaleGatewayAggregateAliases,
   resolveGatewayReengageMode,
+  runGatewayAggregateMutation,
+  subscribeGatewayAggregateConfig,
   toGatewayAggregateReengageConfig,
+  validateGatewayAggregateAlias,
   validateGatewayAggregateSeparator,
 } from '../../../../../features/coding/shared/gateway/gatewayAggregateConfig.ts';
 import {
@@ -59,7 +65,7 @@ test('mode guards keep aggregate distinct from failover', () => {
 
 // ---- separator validation --------------------------------------------------
 
-test('separator must be non-empty and free of site-id characters', () => {
+test('separator must be non-empty and free of every supported site-prefix character', () => {
   assert.equal(validateGatewayAggregateSeparator('.'), null);
   assert.equal(validateGatewayAggregateSeparator('::'), null);
   assert.equal(validateGatewayAggregateSeparator('/'), null);
@@ -70,8 +76,26 @@ test('separator must be non-empty and free of site-id characters', () => {
   assert.equal(validateGatewayAggregateSeparator('9'), 'reservedCharacters');
   assert.equal(validateGatewayAggregateSeparator('_'), 'reservedCharacters');
   assert.equal(validateGatewayAggregateSeparator('-'), 'reservedCharacters');
+  assert.equal(validateGatewayAggregateSeparator('思'), 'reservedCharacters');
+  // Whitespace-only input follows the persisted-command trim semantics, so it
+  // becomes an empty separator rather than a usable whitespace separator.
+  assert.equal(validateGatewayAggregateSeparator(' '), 'empty');
   // One bad character inside an otherwise fine separator is still rejected.
   assert.equal(validateGatewayAggregateSeparator('.-'), 'reservedCharacters');
+});
+
+test('aliases accept safe Unicode provider names and default to them when no custom alias exists', () => {
+  assert.equal(validateGatewayAggregateAlias('思辰888'), true);
+  assert.equal(validateGatewayAggregateAlias('思源888 pro'), true);
+  assert.equal(validateGatewayAggregateAlias(' relay_01-备用 '), true);
+  assert.equal(validateGatewayAggregateAlias('unsafe.name'), false);
+  assert.equal(validateGatewayAggregateAlias(''), false);
+  assert.equal(validateGatewayAggregateAlias('a'.repeat(33)), false);
+
+  assert.equal(defaultGatewayAggregateAlias(' 思辰888 '), '思辰888');
+  assert.equal(defaultGatewayAggregateAlias('思源888 pro'), '思源888 pro');
+  assert.equal(defaultGatewayAggregateAlias('unsafe.name'), null);
+  assert.equal(defaultGatewayAggregateAlias('   '), null);
 });
 
 // ---- site ids --------------------------------------------------------------
@@ -231,6 +255,42 @@ test('latest aggregate operation queue serializes commands and marks stale work'
   assert.equal(await first, 'stale');
   assert.equal(await second, 'applied');
   assert.deepEqual(events, ['first:start', 'first:stale', 'second:apply']);
+});
+
+test('aggregate editor instances share one backend mutation lane and receive canonical refresh notifications', async () => {
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const notificationVersions: number[] = [];
+  const unsubscribe = subscribeGatewayAggregateConfig(() => {
+    notificationVersions.push(getGatewayAggregateConfigVersion());
+  });
+  const beforeVersion = getGatewayAggregateConfigVersion();
+
+  const first = runGatewayAggregateMutation(async () => {
+    events.push('first:start');
+    await firstGate;
+    events.push('first:end');
+    return 'first';
+  });
+  const second = runGatewayAggregateMutation(async () => {
+    events.push('second:start');
+    events.push('second:end');
+    return 'second';
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(events, ['first:start']);
+  releaseFirst();
+  assert.equal(await first, 'first');
+  assert.equal(await second, 'second');
+  assert.deepEqual(events, ['first:start', 'first:end', 'second:start', 'second:end']);
+
+  notifyGatewayAggregateConfigChanged();
+  unsubscribe();
+  assert.deepEqual(notificationVersions, [beforeVersion + 1]);
 });
 
 // ---- re-engage resolution --------------------------------------------------
@@ -394,7 +454,7 @@ test('alias edits produce an immediate re-engage payload only when valid', () =>
     prepareGatewayAggregateAliasReengage(
       {},
       'site-a',
-      'bad alias',
+      'bad.alias',
       ['site-a'],
       true,
       '.',

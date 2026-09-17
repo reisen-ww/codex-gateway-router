@@ -568,11 +568,9 @@ pub(crate) fn resolve_aggregate_route_with_selection(
     }
 
     // Preserve the historical provider-id prefix contract even after a user
-    // opts into aliases or a different catalog template. This also keeps every
-    // enabled (unselected) candidate addressable in aggregate mode.
-    let all_ids = providers
-        .iter()
-        .map(|provider| (provider.id.as_str(), provider.id.as_str()));
+    // opts into aliases/display names or a different catalog template. This
+    // also keeps every enabled (unselected) candidate addressable in aggregate
+    // mode.
     let parsed = match naming.naming {
         AggregateNamingMode::SiteModel => split_site_model_slug(
             requested_model,
@@ -602,7 +600,23 @@ pub(crate) fn resolve_aggregate_route_with_selection(
         ),
         AggregateNamingMode::ModelOnly => None,
     }
-    .or_else(|| split_site_model_slug(requested_model, &naming.separator, all_ids));
+    .or_else(|| match naming.naming {
+        AggregateNamingMode::SiteModel => split_site_model_slug(
+            requested_model,
+            &naming.separator,
+            providers
+                .iter()
+                .map(|provider| (provider.id.as_str(), provider.id.as_str())),
+        ),
+        AggregateNamingMode::ModelAtSite => split_model_at_site_slug(
+            requested_model,
+            &naming.separator,
+            providers
+                .iter()
+                .map(|provider| (provider.id.as_str(), provider.id.as_str())),
+        ),
+        AggregateNamingMode::ModelOnly => None,
+    });
     if let Some((site_id, upstream_model)) = parsed {
         return Ok(AggregateRoute {
             site_id: Some(site_id),
@@ -2247,6 +2261,53 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_route_uses_resolved_display_name_and_keeps_legacy_provider_slug() {
+        let provider_id = "76a6ef74af6c4151812787cc519b534b";
+        let providers = vec![provider(provider_id, None)];
+        let mut selection = aggregate_selection(&[provider_id], ".");
+        selection
+            .aggregate_aliases
+            .insert(provider_id.to_string(), "思辰888".to_string());
+
+        let display_name_route = resolve_aggregate_route_with_selection(
+            "思辰888.deepseek-v4.1-flash",
+            &selection,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(display_name_route.site_id.as_deref(), Some(provider_id));
+        assert_eq!(display_name_route.upstream_model, "deepseek-v4.1-flash");
+
+        // Existing Codex selections that used the raw provider id keep routing
+        // after the catalog moves to the human-readable default prefix.
+        let legacy_route = resolve_aggregate_route_with_selection(
+            "76a6ef74af6c4151812787cc519b534b.deepseek-v4.1-flash",
+            &selection,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(legacy_route.site_id.as_deref(), Some(provider_id));
+        assert_eq!(legacy_route.upstream_model, "deepseek-v4.1-flash");
+
+        selection.aggregate_naming = AggregateNamingMode::ModelAtSite;
+        selection.aggregate_separator = "@".to_string();
+        let legacy_model_at_site_route = resolve_aggregate_route_with_selection(
+            "deepseek-v4.1-flash@76a6ef74af6c4151812787cc519b534b",
+            &selection,
+            &providers,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_model_at_site_route.site_id.as_deref(),
+            Some(provider_id)
+        );
+        assert_eq!(
+            legacy_model_at_site_route.upstream_model,
+            "deepseek-v4.1-flash"
+        );
+    }
+
+    #[test]
     fn aggregate_route_handles_dashed_and_underscored_site_ids() {
         let providers = vec![provider("nofx-a656", None), provider("site_2", None)];
 
@@ -2447,6 +2508,12 @@ mod tests {
         );
         assert!(
             super::super::super::cli_proxy::manifest::validate_aggregate_separator("a").is_err()
+        );
+        assert!(
+            super::super::super::cli_proxy::manifest::validate_aggregate_separator("思").is_err()
+        );
+        assert!(
+            super::super::super::cli_proxy::manifest::validate_aggregate_separator(" ").is_err()
         );
     }
 

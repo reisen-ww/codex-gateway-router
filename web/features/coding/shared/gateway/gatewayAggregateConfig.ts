@@ -8,22 +8,30 @@ import {
   type GatewayAggregateReengageConfig,
 } from './providerSaveReengage';
 import { isGatewayAggregateMode } from './providerProtocol';
+export {
+  getGatewayAggregateConfigVersion,
+  notifyGatewayAggregateConfigChanged,
+  runGatewayAggregateMutation,
+  subscribeGatewayAggregateConfig,
+} from './gatewayAggregateMutation';
 
 /**
  * Aggregate-mode helpers shared by the gateway settings panel and the provider
  * save/re-engage flow.
  *
- * Backend contract (mirrors `cli_proxy/manifest.rs`): a site id must match
- * `^[A-Za-z0-9_-]+$`, and the separator must be non-empty and must not contain
- * letters, digits, `_` or `-`, otherwise `<site_id><sep><model>` cannot be
- * split back into its parts. Keep this module free of i18n text so the callers
- * decide how to phrase the error.
+ * Backend contract (mirrors `cli_proxy/manifest.rs`): provider ids remain
+ * machine identifiers, but legacy aggregate prefixes default to a valid
+ * user-configured provider name. A prefix may use Unicode letters/digits,
+ * ASCII spaces, `_`, and `-`; the separator must avoid that complete charset
+ * so `<site-name><sep><model>` can be split back into its parts. Keep this
+ * module free of i18n text so the callers decide how to phrase the error.
  */
 
 export type GatewayAggregateSeparatorInvalidReason = 'empty' | 'reservedCharacters';
 
 const SITE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
-const ALIAS_PATTERN = /^[A-Za-z0-9_-]+$/;
+const ALIAS_PATTERN = /^[\p{L}\p{N}_ -]+$/u;
+const RESERVED_SEPARATOR_PATTERN = /[\p{L}\p{N}_\-\s]/u;
 // Keep this utility executable from the Node test runner, which intentionally
 // does not install Vite's `@/*` path alias. This mirrors the service contract.
 const DEFAULT_AGGREGATE_SEPARATOR = '.';
@@ -50,14 +58,30 @@ export const validateGatewayAggregateSeparator = (
   if (normalized.length === 0) {
     return 'empty';
   }
-  if (/[A-Za-z0-9_-]/.test(normalized)) {
+  if (RESERVED_SEPARATOR_PATTERN.test(normalized)) {
     return 'reservedCharacters';
   }
   return null;
 };
 
-export const validateGatewayAggregateAlias = (alias: string): boolean =>
-  alias.length > 0 && alias.length <= AGGREGATE_ALIAS_MAX_LENGTH && ALIAS_PATTERN.test(alias);
+export const validateGatewayAggregateAlias = (alias: string): boolean => {
+  const normalized = alias.trim();
+  return (
+    Array.from(normalized).length > 0 &&
+    Array.from(normalized).length <= AGGREGATE_ALIAS_MAX_LENGTH &&
+    ALIAS_PATTERN.test(normalized)
+  );
+};
+
+/**
+ * Mirror the backend's display-name default for a legacy aggregate prefix.
+ * Invalid or ambiguous names stay on the provider-id fallback until the user
+ * supplies a valid explicit alias.
+ */
+export const defaultGatewayAggregateAlias = (providerName: string): string | null => {
+  const normalized = providerName.trim();
+  return validateGatewayAggregateAlias(normalized) ? normalized : null;
+};
 
 /** Group ids are used as the strict `group.model` prefix. */
 export const validateGatewayAggregateGroupId = (groupId: string): boolean => {
@@ -192,6 +216,15 @@ export const normalizeGatewayAggregateAliases = (
     if (seenAliases.has(key)) return null;
     seenAliases.add(key);
     normalized[siteId] = alias;
+  }
+  const providerIdsByKey = new Map(
+    addressableSiteIds.map((siteId) => [siteId.toLowerCase(), siteId] as const),
+  );
+  for (const [siteId, alias] of Object.entries(normalized)) {
+    const conflictingSiteId = providerIdsByKey.get(alias.toLowerCase());
+    if (conflictingSiteId && conflictingSiteId.toLowerCase() !== siteId.toLowerCase()) {
+      return null;
+    }
   }
   const seenPrefixes = new Set<string>();
   for (const siteId of addressableSiteIds) {

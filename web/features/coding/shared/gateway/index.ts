@@ -41,7 +41,9 @@ export {
 export {
   buildGatewayAggregateModelSlug,
   buildGatewayAggregateGroupModelSlug,
+  getGatewayAggregateConfigVersion,
   flattenGatewayAggregateGroups,
+  notifyGatewayAggregateConfigChanged,
   prepareGatewayAggregateAliasReengage,
   normalizeGatewayAggregateGroups,
   normalizeGatewayAggregateAliases,
@@ -49,6 +51,8 @@ export {
   isAggregateSiteId,
   normalizeGatewayAggregateSiteIds,
   resolveGatewayReengageMode,
+  runGatewayAggregateMutation,
+  subscribeGatewayAggregateConfig,
   toGatewayAggregateReengageConfig,
   validateGatewayAggregateSeparator,
   validateGatewayAggregateAlias,
@@ -59,5 +63,6 @@ export {
   isGatewayReengageMode,
   saveProviderWithGatewayReengage,
   type GatewayAggregateReengageConfig,
+  type GatewayReengageSnapshot,
   type GatewayReengageMode,
 } from './providerSaveReengage';

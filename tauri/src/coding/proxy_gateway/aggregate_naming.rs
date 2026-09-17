@@ -1,8 +1,9 @@
 //! Aggregate-mode model naming rules.
 //!
 //! Aggregate mode exposes one Codex model list built from several sites. A site
-//! is addressed by a *prefix token*: the user's alias when configured, otherwise
-//! the auto-generated provider id (`76a6ef74`, `ccex`, …). Three templates are
+//! is addressed by a *prefix token*: the user's explicit alias when configured,
+//! otherwise the provider's configured display name when it is safe to use, and
+//! finally the auto-generated provider id (`76a6ef74`, `ccex`, …). Three templates are
 //! supported:
 //!
 //! - `site_model` (default, the historical behaviour): `<prefix><sep><model>`
@@ -22,11 +23,13 @@
 //! site that declared `deepseek-v4-flash`.
 //!
 //! Invariants:
-//! - Alias charset is `[A-Za-z0-9_-]` (the separator must not be part of a
-//!   prefix token, otherwise `<prefix><sep><model>` cannot be split back).
+//! - Alias charset is Unicode letters/digits plus ASCII spaces, `_`, and `-`.
+//!   The separator rejects that entire charset, so `<prefix><sep><model>` can
+//!   always be split back without treating a human-readable site name as model
+//!   syntax.
 //! - Aliases are unique case-insensitively because aggregate prefix matching is
-//!   ASCII case-insensitive; the same applies to the effective prefix token
-//!   (alias, else provider id) of every site.
+//!   case-insensitive; the same applies to the effective prefix token (alias,
+//!   else provider id) of every site.
 //! - Slugs are globally unique. Collisions are never resolved by silently
 //!   overwriting an earlier entry: `model_only` appends `#N`, and any residual
 //!   collision returns an actionable error.
@@ -82,7 +85,8 @@ impl AggregateNamingMode {
 pub struct AggregateNamingConfig {
     /// Connector between prefix and model name (unused by `model_only`).
     pub separator: String,
-    /// provider id -> user alias. Missing/blank entries fall back to the id.
+    /// provider id -> explicit or display-name-derived site prefix. Missing/blank
+    /// entries fall back to the provider id.
     pub aliases: BTreeMap<String, String>,
     pub naming: AggregateNamingMode,
 }
@@ -98,7 +102,8 @@ impl Default for AggregateNamingConfig {
 }
 
 impl AggregateNamingConfig {
-    /// Prefix token that addresses one site: its alias, else its provider id.
+    /// Prefix token that addresses one site: its resolved alias, else its
+    /// provider id.
     pub fn prefix_for(&self, site_id: &str) -> String {
         aggregate_site_prefix(site_id, &self.aliases).to_string()
     }
@@ -120,6 +125,15 @@ impl AggregateNamingConfig {
     }
 }
 
+/// Normalize a prefix for case-insensitive uniqueness checks and route matching.
+fn aggregate_prefix_key(value: &str) -> String {
+    value.to_lowercase()
+}
+
+fn aggregate_prefix_matches(left: &str, right: &str) -> bool {
+    aggregate_prefix_key(left) == aggregate_prefix_key(right)
+}
+
 /// Validate one configured alias.
 ///
 /// An empty string means "no alias configured" and must be filtered out by the
@@ -136,17 +150,17 @@ pub fn validate_aggregate_alias(alias: &str) -> Result<(), String> {
     }
     if alias
         .chars()
-        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .any(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == ' '))
     {
         return Err(
-            "Aggregate site alias may only contain letters, digits, '_' or '-'".to_string(),
+            "Aggregate site alias may only contain letters, digits, spaces, '_' or '-'".to_string(),
         );
     }
     Ok(())
 }
 
 /// Validate every configured alias: charset/length plus case-insensitive
-/// uniqueness, because prefix matching is ASCII case-insensitive.
+/// uniqueness, because prefix matching is case-insensitive.
 pub fn validate_aggregate_aliases(aliases: &BTreeMap<String, String>) -> Result<(), String> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for (provider_id, alias) in aliases {
@@ -160,7 +174,7 @@ pub fn validate_aggregate_aliases(aliases: &BTreeMap<String, String>) -> Result<
         }
         validate_aggregate_alias(alias)
             .map_err(|error| format!("Aggregate site alias '{alias}': {error}"))?;
-        let key = alias.to_ascii_lowercase();
+        let key = aggregate_prefix_key(alias);
         if let Some(previous) = seen.get(&key) {
             return Err(format!(
                 "Aggregate site alias '{alias}' is used by more than one site ('{previous}' and '{provider_id}'); aliases must be globally unique"
@@ -169,6 +183,100 @@ pub fn validate_aggregate_aliases(aliases: &BTreeMap<String, String>) -> Result<
         seen.insert(key, provider_id);
     }
     Ok(())
+}
+
+/// Return a provider display name when it is safe to use as an aggregate prefix.
+///
+/// This is intentionally conservative: punctuation is excluded so a user-picked
+/// separator cannot become part of the prefix. Callers may still preserve the
+/// opaque provider id for names that are not safe or not unique.
+pub fn default_aggregate_site_alias(site_label: &str) -> Option<String> {
+    let alias = site_label.trim();
+    validate_aggregate_alias(alias)
+        .ok()
+        .map(|_| alias.to_string())
+}
+
+/// Resolve the legacy aggregate prefix map before it is persisted in the
+/// manifest.
+///
+/// Explicit aliases win. For an otherwise unaliased selected provider, use its
+/// configured display name when the name is safe, unique, and cannot shadow an
+/// addressable provider id. This keeps generated model names human-readable
+/// (for example `思辰888.gpt-5`) while retaining the provider id as the
+/// deterministic fallback for collisions or unsafe names.
+pub fn resolve_aggregate_site_aliases(
+    supplied_aliases: BTreeMap<String, String>,
+    selected_sites: &[(String, String)],
+    addressable_site_ids: &[String],
+) -> Result<BTreeMap<String, String>, String> {
+    let selected_ids = selected_sites
+        .iter()
+        .map(|(site_id, _)| site_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut aliases = BTreeMap::new();
+
+    for (raw_site_id, raw_alias) in supplied_aliases {
+        let site_id = raw_site_id.trim();
+        let alias = raw_alias.trim();
+        if alias.is_empty() {
+            continue;
+        }
+        if !selected_ids.contains(site_id) {
+            return Err(format!(
+                "Aggregate alias references unselected site '{raw_site_id}'"
+            ));
+        }
+        aliases.insert(site_id.to_string(), alias.to_string());
+    }
+
+    validate_aggregate_aliases(&aliases)?;
+
+    let explicit_prefixes = aliases
+        .values()
+        .map(|alias| aggregate_prefix_key(alias))
+        .collect::<BTreeSet<_>>();
+    let addressable_id_keys = addressable_site_ids
+        .iter()
+        .map(|site_id| aggregate_prefix_key(site_id))
+        .collect::<BTreeSet<_>>();
+    let mut defaults_by_prefix = BTreeMap::<String, Vec<(String, String)>>::new();
+
+    for (site_id, site_label) in selected_sites {
+        if aliases.contains_key(site_id) {
+            continue;
+        }
+        let Some(alias) = default_aggregate_site_alias(site_label) else {
+            continue;
+        };
+        let key = aggregate_prefix_key(&alias);
+        // An explicit alias wins. A derived display name that looks like another
+        // provider id would make the compatibility provider-id prefix ambiguous,
+        // so leave that provider on its id fallback instead.
+        if explicit_prefixes.contains(&key)
+            || (addressable_id_keys.contains(&key) && !site_id.eq_ignore_ascii_case(alias.as_str()))
+        {
+            continue;
+        }
+        defaults_by_prefix
+            .entry(key)
+            .or_default()
+            .push((site_id.clone(), alias));
+    }
+
+    // If two user-configured provider names are the same, neither silently wins:
+    // each retains the stable provider-id fallback until the user sets an
+    // explicit alias.
+    for candidates in defaults_by_prefix.into_values() {
+        if candidates.len() == 1 {
+            let (site_id, alias) = candidates.into_iter().next().expect("one candidate");
+            aliases.insert(site_id, alias);
+        }
+    }
+
+    validate_aggregate_aliases(&aliases)?;
+    validate_aggregate_site_prefixes(addressable_site_ids, &aliases)?;
+    Ok(aliases)
 }
 
 /// The prefix token that addresses one site: its alias, else its provider id.
@@ -192,13 +300,32 @@ pub fn validate_aggregate_site_prefixes(
     site_ids: &[String],
     aliases: &BTreeMap<String, String>,
 ) -> Result<(), String> {
+    let provider_ids_by_key = site_ids
+        .iter()
+        .map(|site_id| (aggregate_prefix_key(site_id), site_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    // The runtime intentionally keeps provider-id prefixes working for backward
+    // compatibility even after an alias is selected. Therefore an alias cannot
+    // reuse another provider's id, including an id belonging to a selected site.
+    for (provider_id, alias) in aliases {
+        let alias_key = aggregate_prefix_key(alias.trim());
+        if let Some(conflicting_provider_id) = provider_ids_by_key.get(&alias_key) {
+            if !provider_id.eq_ignore_ascii_case(conflicting_provider_id) {
+                return Err(format!(
+                    "Aggregate site alias '{alias}' for '{provider_id}' conflicts with provider id '{conflicting_provider_id}'; choose a different alias"
+                ));
+            }
+        }
+    }
+
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for site_id in site_ids {
         let prefix = aggregate_site_prefix(site_id, aliases);
         if prefix.is_empty() {
             continue;
         }
-        let key = prefix.to_ascii_lowercase();
+        let key = aggregate_prefix_key(prefix);
         if let Some(previous) = seen.get(&key) {
             return Err(format!(
                 "Aggregate site name '{prefix}' addresses both '{previous}' and '{site_id}'; site aliases must be unique across every site"
@@ -330,8 +457,14 @@ pub fn split_site_model_slug<'a>(
         if requested_model.len() <= prefix_len {
             continue;
         }
+        // Client input is not guaranteed to use the same UTF-8 byte length as
+        // a configured Unicode prefix. Never split in the middle of an
+        // arbitrary request character merely to reject a non-matching prefix.
+        if !requested_model.is_char_boundary(prefix.len()) {
+            continue;
+        }
         let (head, rest) = requested_model.split_at(prefix.len());
-        if !head.eq_ignore_ascii_case(prefix) {
+        if !aggregate_prefix_matches(head, prefix) {
             continue;
         }
         let Some(model) = rest.strip_prefix(separator) else {
@@ -367,10 +500,13 @@ pub fn split_model_at_site_slug<'a>(
             continue;
         }
         let split_at = requested_model.len() - suffix_len;
-        // Both sides of the split are ASCII (prefix charset + separator), so
-        // slicing here is safe; the model keeps its own case and separators.
+        // A request can use arbitrary Unicode even when the configured suffix
+        // does not match. Guard the calculated byte offset before slicing.
+        if !requested_model.is_char_boundary(split_at) {
+            continue;
+        }
         let (model, tail) = requested_model.split_at(split_at);
-        if !tail.eq_ignore_ascii_case(&format!("{separator}{prefix}")) {
+        if !aggregate_prefix_matches(tail, &format!("{separator}{prefix}")) {
             continue;
         }
         let model = model.trim();
@@ -406,18 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn alias_validation_accepts_backend_charset_only() {
+    fn alias_validation_accepts_safe_site_name_charset() {
         assert!(validate_aggregate_alias("unsee").is_ok());
         assert!(validate_aggregate_alias("chain888").is_ok());
         assert!(validate_aggregate_alias("my-site_1").is_ok());
+        assert!(validate_aggregate_alias("with space").is_ok());
+        assert!(validate_aggregate_alias("思辰888").is_ok());
+        assert!(validate_aggregate_alias("思源888 pro").is_ok());
         assert!(validate_aggregate_alias(&"a".repeat(AGGREGATE_ALIAS_MAX_LEN)).is_ok());
 
         assert!(validate_aggregate_alias("").is_err());
         assert!(validate_aggregate_alias(&"a".repeat(AGGREGATE_ALIAS_MAX_LEN + 1)).is_err());
-        assert!(validate_aggregate_alias("with space").is_err());
         assert!(validate_aggregate_alias("with.dot").is_err());
         assert!(validate_aggregate_alias("with:colon").is_err());
-        assert!(validate_aggregate_alias("中文").is_err());
     }
 
     #[test]
@@ -457,6 +594,50 @@ mod tests {
 
         assert!(validate_aggregate_site_prefixes(&selected, &aliases).is_ok());
         assert!(validate_aggregate_site_prefixes(&all_enabled, &aliases).is_err());
+    }
+
+    #[test]
+    fn resolver_defaults_to_unique_safe_provider_names_and_keeps_explicit_aliases() {
+        let selected_sites = vec![
+            (
+                "76a6ef74af6c4151812787cc519b534b".to_string(),
+                "思辰888".to_string(),
+            ),
+            ("site-b".to_string(), "思源888 pro".to_string()),
+            ("site-c".to_string(), "思源888".to_string()),
+            ("site-d".to_string(), "unsafe.name".to_string()),
+        ];
+        let addressable_site_ids = selected_sites
+            .iter()
+            .map(|(site_id, _)| site_id.clone())
+            .collect::<Vec<_>>();
+
+        let resolved = resolve_aggregate_site_aliases(
+            aliases(&[("site-b", "manual-name")]),
+            &selected_sites,
+            &addressable_site_ids,
+        )
+        .unwrap();
+
+        // The UUID uses the configured provider name. Explicit aliases still
+        // take precedence, while an unsafe display name falls back to the
+        // stable provider id.
+        assert_eq!(
+            resolved.get("76a6ef74af6c4151812787cc519b534b"),
+            Some(&"思辰888".to_string())
+        );
+        assert_eq!(resolved.get("site-b"), Some(&"manual-name".to_string()));
+        assert_eq!(resolved.get("site-c"), Some(&"思源888".to_string()));
+        assert!(!resolved.contains_key("site-d"));
+
+        let table = build_aggregate_slug_table(
+            &sites(&[("76a6ef74af6c4151812787cc519b534b", &["deepseek-v4.1-flash"])]),
+            ".",
+            &resolved,
+            AggregateNamingMode::SiteModel,
+        )
+        .unwrap();
+        assert_eq!(table[0].slug, "思辰888.deepseek-v4.1-flash");
     }
 
     #[test]
@@ -582,6 +763,32 @@ mod tests {
         assert_eq!(
             split_model_at_site_slug("DeepSeek-V4@UNSEE", "@", [("site-a", "unsee")]),
             Some(("site-a".to_string(), "DeepSeek-V4".to_string()))
+        );
+        assert_eq!(
+            split_site_model_slug(
+                "思辰888.DeepSeek-V4",
+                ".",
+                [("76a6ef74af6c4151812787cc519b534b", "思辰888")],
+            ),
+            Some((
+                "76a6ef74af6c4151812787cc519b534b".to_string(),
+                "DeepSeek-V4".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn split_helpers_reject_non_matching_unicode_without_invalid_utf8_slices() {
+        // These inputs are not valid slugs for the configured ASCII prefix.
+        // They must be rejected, not panic while calculating a byte offset
+        // inside an arbitrary Unicode character from a client request.
+        assert_eq!(
+            split_site_model_slug("思.model", ".", [("site-a", "a")]),
+            None
+        );
+        assert_eq!(
+            split_model_at_site_slug(".思a", ".", [("site-a", "a")]),
+            None
         );
     }
 }
