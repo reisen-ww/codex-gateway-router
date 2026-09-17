@@ -200,6 +200,11 @@ interface GatewayAggregateSettingsProps {
   onTakeoverChange?: () => void;
 }
 
+type GatewayAggregateGroupDraft = GatewayAggregateGroup & {
+  /** Stable UI-only identity: a group id can be edited before it is committed. */
+  draftKey: string;
+};
+
 const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   running,
   onTakeoverChange,
@@ -212,7 +217,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   const [separator, setSeparator] = React.useState<string>(DEFAULT_AGGREGATE_SEPARATOR);
   const [aliases, setAliases] = React.useState<Record<string, string>>({});
   const [naming, setNaming] = React.useState<GatewayAggregateNamingMode>('site_model');
-  const [groups, setGroups] = React.useState<GatewayAggregateGroup[]>([]);
+  const [groups, setGroups] = React.useState<GatewayAggregateGroupDraft[]>([]);
   const [cliStatuses, setCliStatuses] = React.useState<GatewayCliTakeoverStatus[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<{ kind: 'error' | 'success'; text: string } | null>(
@@ -222,6 +227,14 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   const statusRequestRef = React.useRef(0);
   const mountedRef = React.useRef(true);
   const operationQueueRef = React.useRef(createLatestGatewayAggregateOperationQueue());
+  const groupDraftKeyRef = React.useRef(0);
+  const createGroupDraft = React.useCallback(
+    (group: GatewayAggregateGroup): GatewayAggregateGroupDraft => ({
+      ...group,
+      draftKey: `gateway-aggregate-group-${++groupDraftKeyRef.current}`,
+    }),
+    [],
+  );
 
   const selectedStatus = React.useMemo(
     () => cliStatuses.find((status) => status.cli_key === cliKey) ?? null,
@@ -372,7 +385,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
             loadingSites ? undefined : addressableSiteIds,
           ),
     );
-    setGroups(savedGroups);
+    setGroups(savedGroups.map(createGroupDraft));
     if (!saved) {
       setSiteIds([]);
       return;
@@ -381,7 +394,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     // and recoverable instead of silently deleting user configuration. In
     // strict mode, the grouped order is the canonical compatibility order.
     setSiteIds(savedSiteIds);
-  }, [addressableSiteIds, candidates, loadingSites, selectedStatus]);
+  }, [addressableSiteIds, candidates, createGroupDraft, loadingSites, selectedStatus]);
 
   const runGatewayOperation = React.useCallback(
     async (
@@ -428,8 +441,14 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       nextAliases: Record<string, string>,
       nextNaming: GatewayAggregateNamingMode,
       nextGroups: GatewayAggregateGroup[] = [],
-    ) =>
-      runGatewayOperation(
+    ) => {
+      // Draft keys only exist to keep editable rows mounted. Do not pass them
+      // across the frontend/backend boundary.
+      const requestGroups = nextGroups.map((group) => ({
+        id: group.id,
+        provider_ids: [...group.provider_ids],
+      }));
+      return runGatewayOperation(
         () =>
           engageProxyGatewayAggregate(
             cliKey,
@@ -437,11 +456,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
             nextSeparator,
             nextAliases,
             nextNaming,
-            nextGroups,
+            requestGroups,
           ),
         t('gateway.aggregate.notice.enabled'),
         'enableFailed',
-      ),
+      );
+    },
     [cliKey, runGatewayOperation, t],
   );
 
@@ -666,7 +686,10 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     const initialProviderIds = groups.length === 0
       ? normalizeGatewayAggregateSiteIds(siteIds)
       : [];
-    const nextGroups = [...groups, { id: `group-${index}`, provider_ids: initialProviderIds }];
+    const nextGroups = [
+      ...groups,
+      createGroupDraft({ id: `group-${index}`, provider_ids: initialProviderIds }),
+    ];
     setGroups(nextGroups);
     const nextSiteIds = flattenGatewayAggregateGroups(nextGroups);
     setSiteIds(nextSiteIds);
@@ -698,8 +721,8 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     }
   };
 
-  const handleRemoveGroup = (groupId: string) => {
-    const nextGroups = groups.filter((group) => group.id !== groupId);
+  const handleRemoveGroup = (groupDraftKey: string) => {
+    const nextGroups = groups.filter((group) => group.draftKey !== groupDraftKey);
     setGroups(nextGroups);
     setSiteIds(nextGroups.length > 0
       ? flattenGatewayAggregateGroups(nextGroups)
@@ -707,8 +730,10 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     reengageWithGroups(nextGroups);
   };
 
-  const handleGroupIdChange = (groupId: string, id: string) => {
-    setGroups(groups.map((group) => (group.id === groupId ? { ...group, id } : group)));
+  const handleGroupIdChange = (groupDraftKey: string, id: string) => {
+    setGroups(
+      groups.map((group) => (group.draftKey === groupDraftKey ? { ...group, id } : group)),
+    );
   };
 
   const handleGroupIdCommit = () => {
@@ -717,13 +742,23 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       setNotice({ kind: 'error', text: t('gateway.aggregate.groupsInvalid') });
       return;
     }
-    setGroups(normalized);
-    reengageWithGroups(normalized);
+    const nextGroups = normalized.map((group, index) => {
+      const currentDraft = groups[index];
+      return currentDraft
+        ? { ...group, draftKey: currentDraft.draftKey }
+        : createGroupDraft(group);
+    });
+    setGroups(nextGroups);
+    reengageWithGroups(nextGroups);
   };
 
-  const handleToggleGroupSite = (groupId: string, siteId: string, checked: boolean) => {
+  const handleToggleGroupSite = (
+    groupDraftKey: string,
+    siteId: string,
+    checked: boolean,
+  ) => {
     const nextGroups = groups.map((group) => {
-      if (group.id !== groupId) return group;
+      if (group.draftKey !== groupDraftKey) return group;
       const provider_ids = checked
         ? normalizeGatewayAggregateSiteIds([...group.provider_ids, siteId])
         : group.provider_ids.filter((item) => item !== siteId);
@@ -736,12 +771,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   };
 
   const handleMoveGroupSite = (
-    groupId: string,
+    groupDraftKey: string,
     siteId: string,
     direction: 'up' | 'down',
   ) => {
     const nextGroups = groups.map((group) =>
-      group.id === groupId
+      group.draftKey === groupDraftKey
         ? { ...group, provider_ids: moveAggregateSite(group.provider_ids, siteId, direction) }
         : group,
     );
@@ -750,16 +785,16 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     reengageWithGroups(nextGroups);
   };
 
-  const handleGroupDragEnd = (groupId: string, event: DragEndEvent) => {
+  const handleGroupDragEnd = (groupDraftKey: string, event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const group = groups.find((item) => item.id === groupId);
+    const group = groups.find((item) => item.draftKey === groupDraftKey);
     if (!group) return;
     const oldIndex = group.provider_ids.indexOf(String(active.id));
     const newIndex = group.provider_ids.indexOf(String(over.id));
     if (oldIndex < 0 || newIndex < 0) return;
     const nextGroups = groups.map((item) =>
-      item.id === groupId
+      item.draftKey === groupDraftKey
         ? { ...item, provider_ids: arrayMove(item.provider_ids, oldIndex, newIndex) }
         : item,
     );
@@ -980,7 +1015,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                 );
                 const groupIdInvalid = !validateGatewayAggregateGroupId(group.id);
                 return (
-                  <section className={styles.groupSection} key={group.id}>
+                  <section className={styles.groupSection} key={group.draftKey}>
                     <div className={styles.groupHeader}>
                       <label className={styles.groupNameField}>
                         <span className={styles.srOnly}>{t('gateway.aggregate.groupId')}</span>
@@ -992,7 +1027,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                           aria-label={t('gateway.aggregate.groupId')}
                           aria-invalid={groupIdInvalid}
                           onChange={(event) =>
-                            handleGroupIdChange(group.id, event.currentTarget.value)
+                            handleGroupIdChange(group.draftKey, event.currentTarget.value)
                           }
                           onBlur={handleGroupIdCommit}
                         />
@@ -1003,7 +1038,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                         disabled={busy}
                         aria-label={`${t('gateway.aggregate.removeGroup')}: ${group.id}`}
                         title={t('gateway.aggregate.removeGroup')}
-                        onClick={() => handleRemoveGroup(group.id)}
+                        onClick={() => handleRemoveGroup(group.draftKey)}
                       >
                         <Trash2 size={13} aria-hidden="true" />
                       </button>
@@ -1017,7 +1052,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                       sensors={busy ? [] : sensors}
                       collisionDetection={closestCenter}
                       modifiers={[restrictToVerticalAxis]}
-                      onDragEnd={(event) => handleGroupDragEnd(group.id, event)}
+                      onDragEnd={(event) => handleGroupDragEnd(group.draftKey, event)}
                     >
                       <SortableContext
                         items={group.provider_ids}
@@ -1026,15 +1061,15 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                         <ul className={styles.siteList}>
                           {groupCandidates.map((candidate, index) => (
                             <SortableSiteRow
-                              key={`${group.id}:${candidate.id}`}
+                              key={`${group.draftKey}:${candidate.id}`}
                               candidate={candidate}
                               index={index}
                               lastIndex={groupCandidates.length - 1}
                               onToggleSite={(siteId, checked) =>
-                                handleToggleGroupSite(group.id, siteId, checked)
+                                handleToggleGroupSite(group.draftKey, siteId, checked)
                               }
                               onMoveSite={(siteId, direction) =>
-                                handleMoveGroupSite(group.id, siteId, direction)
+                                handleMoveGroupSite(group.draftKey, siteId, direction)
                               }
                               disabled={busy}
                               alias={aliases[candidate.id] ?? ''}
@@ -1061,7 +1096,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                           aria-label={`${group.id}: ${t('gateway.aggregate.addSiteToGroup')}`}
                           onChange={(event) => {
                             const siteId = event.currentTarget.value;
-                            if (siteId) handleToggleGroupSite(group.id, siteId, true);
+                            if (siteId) handleToggleGroupSite(group.draftKey, siteId, true);
                           }}
                         >
                           <option value="">
