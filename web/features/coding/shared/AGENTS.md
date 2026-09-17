@@ -59,6 +59,7 @@ sequenceDiagram
 - 改 root directory、favorite provider、session manager 这类共享能力时，要先确认是不是所有消费页面都要同步调整，而不是只修当前页面。
 - `RootDirectoryModal` 只对 `source === custom` 的值做输入框回填；不要把 env/shell/default 的当前生效路径直接塞回输入框，否则用户会误以为那是显式保存的自定义路径。
 - Claude/Codex/Grok CLI/Gemini CLI 的根目录保存最终会走各自 common config 保存命令。Gateway 接管期间必须像通用配置保存一样锁住根目录保存和恢复默认，否则会绕过 provider 卡片的代理中编辑保护并触发 runtime auto-apply。
+- Claude/Claude Desktop/Codex/Grok/Gemini/Kimi 页面的 `loadConfig()` 可能被手动刷新、保存回调和事件回调重叠调用；必须用单调 request id 保护 provider、Gateway status、错误和 loading 的写入，并在 provider 列表落地后独立刷新 `getProxyGatewayCliStatus`，否则旧响应会覆盖新状态或 stale `can_takeover` 让网关入口消失。
 - `favoriteProviders.ts` 的 key/payload 规则会影响多个模块的数据迁移和去重；这里不能随意改前缀或 payload 结构。
 - 对 OpenCode/Claude/Codex/OpenClaw 这些页，“favorite provider” 的语义更接近“历史库 + 诊断缓存”，不是当前配置快照。改共享 helper 时不要把它偷偷重定义成当前配置镜像。
 - `SessionManagerPanel` 依赖 `tool + sourcePath` 契约，不能把 `sourcePath` 当作纯展示字段。

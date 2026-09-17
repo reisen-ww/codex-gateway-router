@@ -124,6 +124,7 @@ import {
   engageProxyGatewayAggregate,
   engageProxyGatewayFailover,
   engageProxyGatewaySingle,
+  getProxyGatewayCliStatus,
   restoreProxyGatewayCliDirect,
   type GatewayCliTakeoverStatus,
 } from '@/services';
@@ -402,7 +403,9 @@ const ClaudeCodePage: React.FC = () => {
     });
   }, [providers]);
 
+  const loadConfigRequestIdRef = React.useRef(0);
   const loadConfig = React.useCallback(async (silent = false) => {
+    const requestId = ++loadConfigRequestIdRef.current;
     setLoading(true);
     try {
       const [path, nextRootPathInfo, providerList] = await Promise.all([
@@ -410,6 +413,7 @@ const ClaudeCodePage: React.FC = () => {
         getClaudeRootPathInfo(),
         listClaudeProviders(),
       ]);
+      if (requestId !== loadConfigRequestIdRef.current) return;
 
       setConfigPath(path);
       setRootPathInfo(nextRootPathInfo);
@@ -418,13 +422,22 @@ const ClaudeCodePage: React.FC = () => {
 
       const applied = providerList.find((p) => p.isApplied);
       setAppliedProviderId(applied?.id || '');
+      void getProxyGatewayCliStatus('claude')
+        .then((status) => {
+          if (requestId !== loadConfigRequestIdRef.current) return;
+          setGatewayCliStatus(status);
+        })
+        .catch(() => {});
     } catch (error) {
+      if (requestId !== loadConfigRequestIdRef.current) return;
       console.error('Failed to load config:', error);
       if (!silent) {
         message.error(t('common.error'));
       }
     } finally {
-      setLoading(false);
+      if (requestId === loadConfigRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [t]);
 

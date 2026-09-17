@@ -158,6 +158,7 @@ import {
   engageProxyGatewayAggregate,
   engageProxyGatewayFailover,
   engageProxyGatewaySingle,
+  getProxyGatewayCliStatus,
   restoreProxyGatewayCliDirect,
   type GatewayCliTakeoverStatus,
 } from '@/services';
@@ -338,7 +339,9 @@ const GrokPage: React.FC = () => {
     },
   ], [t]);
 
+  const loadConfigRequestIdRef = React.useRef(0);
   const loadConfig = React.useCallback(async (silent = false) => {
+    const requestId = ++loadConfigRequestIdRef.current;
     setLoading(true);
     try {
       const [path, nextRootPathInfo, providerList] = await Promise.all([
@@ -346,6 +349,7 @@ const GrokPage: React.FC = () => {
         getGrokRootPathInfo(),
         listGrokProviders(),
       ]);
+      if (requestId !== loadConfigRequestIdRef.current) return;
       setConfigPath(path);
       setRootPathInfo(nextRootPathInfo);
       setProviders(providerList);
@@ -357,18 +361,28 @@ const GrokPage: React.FC = () => {
             : [],
         ] as const),
       );
+      if (requestId !== loadConfigRequestIdRef.current) return;
       setOfficialAccountsByProviderId(Object.fromEntries(officialAccountEntries));
       setPluginPanelRefreshToken((value) => value + 1);
       const applied = providerList.find((p) => p.isApplied);
       setAppliedProviderId(applied?.id || '');
+      void getProxyGatewayCliStatus('grok')
+        .then((status) => {
+          if (requestId !== loadConfigRequestIdRef.current) return;
+          setGatewayCliStatus(status);
+        })
+        .catch(() => {});
     } catch (error) {
+      if (requestId !== loadConfigRequestIdRef.current) return;
       console.error('Failed to load config:', error);
       if (!silent) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         message.error(errorMsg || t('common.error'));
       }
     } finally {
-      setLoading(false);
+      if (requestId === loadConfigRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [t]);
 

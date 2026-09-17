@@ -108,6 +108,7 @@ import {
   engageProxyGatewayAggregate,
   engageProxyGatewayFailover,
   engageProxyGatewaySingle,
+  getProxyGatewayCliStatus,
   restoreProxyGatewayCliDirect,
   type GatewayCliTakeoverStatus,
 } from '@/services';
@@ -229,7 +230,9 @@ const GeminiCliPage: React.FC = () => {
     { id: 'geminicli-session-manager', title: t('sessionManager.title'), order: 3 },
   ], [t]);
 
+  const loadConfigRequestIdRef = React.useRef(0);
   const loadConfig = React.useCallback(async (silent = false) => {
+    const requestId = ++loadConfigRequestIdRef.current;
     setLoading(true);
     try {
       const [path, nextRootPathInfo, providerList] = await Promise.all([
@@ -237,6 +240,7 @@ const GeminiCliPage: React.FC = () => {
         getGeminiCliRootPathInfo(),
         listGeminiCliProviders(),
       ]);
+      if (requestId !== loadConfigRequestIdRef.current) return;
       setConfigPath(path);
       setRootPathInfo(nextRootPathInfo);
       setProviders(providerList);
@@ -248,16 +252,26 @@ const GeminiCliPage: React.FC = () => {
             : [],
         ] as const),
       );
+      if (requestId !== loadConfigRequestIdRef.current) return;
       setOfficialAccountsByProviderId(Object.fromEntries(officialAccountEntries));
       setAppliedProviderId(providerList.find((provider) => provider.isApplied)?.id || '');
+      void getProxyGatewayCliStatus('gemini')
+        .then((status) => {
+          if (requestId !== loadConfigRequestIdRef.current) return;
+          setGatewayCliStatus(status);
+        })
+        .catch(() => {});
     } catch (error) {
+      if (requestId !== loadConfigRequestIdRef.current) return;
       console.error('Failed to load Gemini CLI config:', error);
       if (!silent) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         message.error(errorMsg || t('common.error'));
       }
     } finally {
-      setLoading(false);
+      if (requestId === loadConfigRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [t]);
 

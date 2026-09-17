@@ -79,6 +79,7 @@ import {
   engageProxyGatewayAggregate,
   engageProxyGatewayFailover,
   engageProxyGatewaySingle,
+  getProxyGatewayCliStatus,
   restoreProxyGatewayCliDirect,
   type GatewayCliTakeoverStatus,
 } from '@/services';
@@ -410,26 +411,38 @@ const ClaudeDesktopPage: React.FC = () => {
     [],
   );
 
+  const loadConfigRequestIdRef = React.useRef(0);
   const loadConfig = React.useCallback(
     async (silent = false) => {
+      const requestId = ++loadConfigRequestIdRef.current;
       setLoading(true);
       try {
         const [paths, providerList] = await Promise.all([
           getClaudeDesktopPaths(),
           listClaudeDesktopProviders(),
         ]);
+        if (requestId !== loadConfigRequestIdRef.current) return;
         setPathInfo(paths);
         setProviders(providerList);
 
         const applied = providerList.find((p) => p.isApplied);
         setAppliedProviderId(applied?.id || '');
+        void getProxyGatewayCliStatus('claude_desktop')
+          .then((status) => {
+            if (requestId !== loadConfigRequestIdRef.current) return;
+            setGatewayCliStatus(status);
+          })
+          .catch(() => {});
       } catch (error) {
+        if (requestId !== loadConfigRequestIdRef.current) return;
         console.error('Failed to load Claude Desktop config:', error);
         if (!silent) {
           message.error(t('common.error'));
         }
       } finally {
-        setLoading(false);
+        if (requestId === loadConfigRequestIdRef.current) {
+          setLoading(false);
+        }
       }
     },
     [t],
