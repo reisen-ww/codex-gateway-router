@@ -38,8 +38,8 @@ pub fn save_settings(
 }
 
 pub fn settings_from_value(value: Value) -> Result<ProxyGatewaySettings, String> {
-    let settings: ProxyGatewaySettings =
-        serde_json::from_value(value).unwrap_or_else(|_| ProxyGatewaySettings::default());
+    let settings: ProxyGatewaySettings = serde_json::from_value(value)
+        .map_err(|error| format!("Failed to deserialize proxy gateway settings: {error}"))?;
     normalize_loaded_settings(settings)
 }
 
@@ -179,6 +179,16 @@ mod tests {
         assert!(settings.thinking_rectifier_enabled);
         assert!(settings.responses_encrypted_content_rectifier_enabled);
         assert!(!settings.lossy_rejection_enabled);
+    }
+
+    #[test]
+    fn malformed_settings_are_rejected_instead_of_resetting_to_defaults() {
+        let error = settings_from_value(json!({
+            "listen_port": "not-a-port",
+        }))
+        .expect_err("malformed persisted settings must be reported");
+
+        assert!(error.contains("Failed to deserialize proxy gateway settings"));
     }
 
     #[test]
